@@ -1,11 +1,14 @@
 use std::ops::Range;
 
 use anyhow::{Context, Result, ensure};
-use object::{Object, ObjectSection, SectionKind};
+use object::{Object, ObjectSection};
 use scene_disasm::{Listing, arm64::Insn};
-use scene_passes::arm64::{Options, reachable_len, transform};
+use scene_passes::arm64::{Options, mba_sites, reachable_len, substitute, transform};
 
 use crate::macho::{self, functions, layout::CodeLayout};
+
+mod report;
+use report::Report;
 
 pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
     let layout = CodeLayout::new(file, data)?;
@@ -15,23 +18,13 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
     let functions = functions::in_text(file, base, size)?;
     let dice = macho::data_in_code(file)?;
     let insns = decode(section.data()?, base, offset, &dice)?;
-    let mut references = Vec::new();
-    for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
-        let Some((offset, _)) = section.file_range() else { continue };
-        for insn in decode(section.data()?, section.address(), offset, &dice)? {
-            if let Some(target) = insn.target {
-                references.push((insn.address, target));
-            }
-        }
-    }
     if dump {
         print!("; __text @ {base:#x}\n{}", Listing::Arm64(insns.clone()));
     }
     let mut out = data.to_vec();
     let mut code = Vec::new();
     let mut entries = Vec::new();
-    let mut substitutions = 0;
-    let mut skipped = 0;
+    let mut report = Report::default();
     for function in functions {
         let candidate = &insns[function.range.clone()];
         let destination = layout.base + code.len() as u64;
@@ -39,13 +32,6 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
             let len = reachable_len(candidate)?;
             let candidate = &candidate[..len];
             let start = candidate[0].address;
-            let end = start + len as u64 * 4;
-            ensure!(
-                !references.iter().any(|&(source, target)| target > start
-                    && target < end
-                    && !(start..end).contains(&source)),
-                "reference to function interior"
-            );
             let options =
                 Options { seed: Options::default().seed ^ start as u32, ..Options::default() };
             let output = transform(candidate, destination, options)?;
@@ -53,47 +39,108 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
                 layout.fits(code.len() + output.insns.len() * 4),
                 "executable padding exhausted"
             );
-            let jump = scene_asm::arm64::retarget(0x1400_0000, start, destination)?;
-            Ok((len, output, jump))
+            let mut bridges = Vec::with_capacity(output.resumes.len() + 1);
+            bridges.push((
+                output.entry_patch,
+                scene_asm::arm64::retarget(0x1400_0000, output.entry_patch, destination)?,
+            ));
+            for (&address, &resume) in &output.resumes {
+                bridges.push((address, scene_asm::arm64::retarget(0x1400_0000, address, resume)?));
+            }
+            Ok((len, output, bridges))
         })();
-        let (len, output, jump) = match converted {
+        let (len, output, bridges) = match converted {
             Ok(converted) => converted,
             Err(error) => {
-                eprintln!("{}: skipped: {error:#}", function.name);
-                skipped += 1;
+                report.cff_skip(&error);
+                match substitute_function(candidate, &layout, code.len()) {
+                    Ok(patches) if !patches.entries.is_empty() => {
+                        let count = patches.entries.len();
+                        apply(&mut out, offset, base, patches.words);
+                        code.extend_from_slice(&patches.code);
+                        entries.extend_from_slice(&patches.entries);
+                        report.substitutions += count;
+                        report.mba_only += 1;
+                        if dump {
+                            eprintln!("{}: {count} mba, cff skipped: {error:#}", function.name);
+                        }
+                    }
+                    Ok(_) => {
+                        report.skip("no eligible arithmetic");
+                        if dump {
+                            eprintln!(
+                                "{}: skipped: {error:#}; no eligible arithmetic",
+                                function.name
+                            );
+                        }
+                    }
+                    Err(reason) => {
+                        report.skip(reason.root_cause().to_string());
+                        if dump {
+                            eprintln!("{}: skipped: {reason:#}", function.name);
+                        }
+                    }
+                }
                 continue;
             }
         };
-        let byte_start = offset as usize + function.range.start * 4;
-        let byte_end = byte_start + len * 4;
-        for word in out[byte_start..byte_end].as_chunks_mut::<4>().0 {
-            *word = 0xD420_0000u32.to_le_bytes();
-        }
-        out[byte_start..byte_start + 4].copy_from_slice(&jump.to_le_bytes());
+        apply(&mut out, offset, base, bridges);
         let code_size = output.insns.len() * 4;
-        eprintln!(
-            "{}: {:#x} -> {destination:#x}, {} -> {code_size} bytes, {} blocks, {} mba",
-            function.name,
-            candidate[0].address,
-            len * 4,
-            output.blocks,
-            output.substitutions
-        );
-        substitutions += output.substitutions;
+        if dump {
+            eprintln!(
+                "{}: {:#x} -> {destination:#x}, {} -> {code_size} bytes, {} blocks, {} mba",
+                function.name,
+                candidate[0].address,
+                len * 4,
+                output.blocks,
+                output.substitutions
+            );
+        }
+        report.substitutions += output.substitutions;
         let listing = Listing::Arm64(output.insns);
         if dump {
             print!("; {} @ {destination:#x}\n{listing}", function.name);
         }
         code.extend_from_slice(&scene_asm::assemble(&listing, destination, code_size)?);
         entries.push(destination);
+        report.cff += 1;
     }
-    ensure!(!entries.is_empty(), "no supported arm64 leaf functions to transform");
-    eprintln!(
-        "{} functions transformed, {skipped} skipped, {substitutions} mba, {} code bytes",
-        entries.len(),
-        code.len()
-    );
+    report.print(code.len());
+    ensure!(!entries.is_empty(), "no eligible instructions to transform");
     layout.finish(&out, code, &entries)
+}
+
+fn apply(out: &mut [u8], offset: u64, base: u64, words: Vec<(u64, u32)>) {
+    for (address, word) in words {
+        let at = (offset + address - base) as usize;
+        out[at..at + 4].copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+struct Patches {
+    words: Vec<(u64, u32)>,
+    entries: Vec<u64>,
+    code: Vec<u8>,
+}
+
+fn substitute_function(insns: &[Insn], layout: &CodeLayout, used: usize) -> Result<Patches> {
+    let mut patches = Patches { words: Vec::new(), entries: Vec::new(), code: Vec::new() };
+    for index in mba_sites(insns)? {
+        let insn = &insns[index];
+        let destination = layout.base + (used + patches.code.len()) as u64;
+        let Some(replacement) = substitute(insn, destination)? else { continue };
+        let size = replacement.len() * 4;
+        ensure!(layout.fits(used + patches.code.len() + size), "executable padding exhausted");
+        let jump = scene_asm::arm64::retarget(0x1400_0000, insn.address, destination)?;
+        patches.code.extend_from_slice(&scene_asm::assemble(
+            &Listing::Arm64(replacement),
+            destination,
+            size,
+        )?);
+        patches.words.push((insn.address, jump));
+        patches.entries.push(destination);
+    }
+    Ok(patches)
 }
 
 fn decode(bytes: &[u8], base: u64, offset: u64, data: &[Range<u64>]) -> Result<Vec<Insn>> {

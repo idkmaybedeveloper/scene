@@ -31,10 +31,25 @@ pub struct Output {
     pub substitutions: usize,
     pub flattened: bool,
     pub block_addresses: BTreeMap<u64, u64>,
+    pub resumes: BTreeMap<u64, u64>,
+    pub entry_patch: u64,
 }
 
 pub fn reachable_len(insns: &[Insn]) -> Result<usize> {
     cfg::reachable_len(insns)
+}
+
+pub fn mba_sites(insns: &[Insn]) -> Result<Vec<usize>> {
+    cfg::mba_sites(insns)
+}
+
+pub fn substitute(insn: &Insn, base: u64) -> Result<Option<Vec<Insn>>> {
+    let mut emitter = Emitter::new(base)?;
+    if !mba::emit(insn.word, &mut emitter) {
+        return Ok(None);
+    }
+    emitter.jump_to(insn.address + 4);
+    Ok(Some(emitter.finish()?))
 }
 
 pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> {
@@ -47,7 +62,7 @@ pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> 
         for (index, block) in function.blocks.iter().enumerate() {
             emitter.bind(labels[index]);
             emit_body(&mut emitter, &insns[block.body.clone()], options.mba)?;
-            block.exit.emit(&mut emitter, &labels)?;
+            block.exit.emit(&mut emitter, &labels);
         }
     }
     let block_addresses = function
@@ -57,12 +72,15 @@ pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> 
         .map(|(block, &label)| Ok((block.address, emitter.address(label)?)))
         .collect::<Result<_>>()?;
     let substitutions = emitter.substitutions;
+    let resumes = emitter.resumes.clone();
     Ok(Output {
         insns: emitter.finish()?,
         blocks: function.blocks.len(),
         substitutions,
         flattened: options.cff,
         block_addresses,
+        resumes,
+        entry_patch: function.entry_patch,
     })
 }
 

@@ -5,7 +5,7 @@ use object::{
     macho,
 };
 
-use super::functions;
+use super::{functions, sections};
 
 const SEGMENT: &[u8] = b"__SCENE";
 const PAGE_SIZE: u64 = 0x4000;
@@ -19,6 +19,7 @@ pub struct CodeLayout {
     pub base: u64,
     text_base: u64,
     placement: Placement,
+    merge_constants: bool,
 }
 
 impl CodeLayout {
@@ -33,8 +34,9 @@ impl CodeLayout {
             "input is not a linked image"
         );
         ensure!(
-            header.cpusubtype.get(endian).0 & 0xFF == macho::CPU_SUBTYPE_ARM64_ALL.0,
-            "arm64e is unsupported"
+            [macho::CPU_SUBTYPE_ARM64_ALL.0, macho::CPU_SUBTYPE_ARM64E.0]
+                .contains(&(header.cpusubtype.get(endian).0 & 0x00FF_FFFF)),
+            "unsupported arm64 subtype"
         );
         ensure!(
             !file.segments().any(|s| s.name().ok().flatten() == Some("__SCENE")),
@@ -47,7 +49,7 @@ impl CodeLayout {
         let text = file
             .segments()
             .find(|s| s.name().ok().flatten() == Some("__TEXT"))
-            .context("missing __TEXT")?;
+            .context("missing __text")?;
         ensure!(linkedit.address().is_multiple_of(PAGE_SIZE), "unaligned linkedit");
         ensure!(
             file.segments().all(|s| s.address() <= linkedit.address()),
@@ -61,14 +63,17 @@ impl CodeLayout {
             .map(|(o, _)| o as usize)
             .min()
             .context("missing section data")?;
+        let merge_constants = sections::can_merge_constants(file);
         let required_end = commands_end.checked_add(152).context("load command size overflow")?;
+        let required_end = required_end - if merge_constants { 80 } else { 0 };
         if required_end <= first_section
-            && data.get(commands_end..required_end).is_some_and(|b| b.iter().all(|&b| b == 0))
+            && data.get(commands_end..first_section).is_some_and(|b| b.iter().all(|&b| b == 0))
         {
             return Ok(Self {
                 base: linkedit.address(),
                 text_base: text.address(),
                 placement: Placement::Segment,
+                merge_constants,
             });
         }
         let (text_offset, text_size) = text.file_range();
@@ -91,6 +96,7 @@ impl CodeLayout {
             base: text.address() + offset - text_offset,
             text_base: text.address(),
             placement: Placement::Padding { offset: offset as usize, capacity: padding.len() },
+            merge_constants: false,
         })
     }
 
@@ -104,6 +110,9 @@ impl CodeLayout {
     pub fn finish(self, data: &[u8], code: Vec<u8>, entries: &[u64]) -> Result<Vec<u8>> {
         let original = object::File::parse(data)?;
         let mut builder = Builder::read(data).context("reading image for rebuild")?;
+        if self.merge_constants {
+            sections::merge_constants(&mut builder, data)?;
+        }
         for command in &builder.commands {
             if let LoadCommand::Other { cmd, .. } = command {
                 ensure!(
@@ -112,9 +121,13 @@ impl CodeLayout {
                 );
             }
         }
-        if matches!(self.placement, Placement::Segment) {
-            add_segment(&mut builder, self.base, code.clone())?;
-        }
+        let padding = match self.placement {
+            Placement::Segment => {
+                add_segment(&mut builder, self.base, code)?;
+                None
+            }
+            Placement::Padding { offset, .. } => Some((offset, code)),
+        };
         let mut starts = functions::starts(&original)?;
         starts.extend_from_slice(entries);
         starts.sort_unstable();
@@ -129,12 +142,10 @@ impl CodeLayout {
             previous = start;
         }
         encoded.push(0);
-        for command in &mut builder.commands {
-            if let LoadCommand::LinkeditData { cmd, data } = command
-                && *cmd == macho::LC_FUNCTION_STARTS
-            {
-                *data = encoded.clone().into();
-            }
+        if let Some(LoadCommand::LinkeditData { data, .. }) = builder.commands.iter_mut().find(
+            |command| matches!(command, LoadCommand::LinkeditData { cmd, .. } if *cmd == macho::LC_FUNCTION_STARTS)
+        ) {
+            *data = encoded.into();
         }
         let mut out = Vec::new();
         builder.write(&mut out).context("rebuildin!")?;
@@ -144,16 +155,28 @@ impl CodeLayout {
             let segment = section.segment_name()?;
             let replacement = rebuilt
                 .sections()
-                .find(|s| s.name().ok() == Some(name) && s.segment_name().ok() == Some(segment))
+                .find(|s| {
+                    s.segment_name().ok() == Some(segment)
+                        && s.address() <= section.address()
+                        && s.address() + s.size() >= section.address() + section.size()
+                })
                 .context("rebuild lost an existing section")?;
+            let delta = section.address() - replacement.address();
             ensure!(
-                replacement.address() == section.address()
-                    && replacement.file_range() == section.file_range(),
+                replacement.file_range().map(|(o, _)| o + delta)
+                    == section.file_range().map(|(o, _)| o),
                 "rebuild moved existing section {name}"
             );
-            ensure!(replacement.data()? == section.data()?, "rebuild changed section data {name}");
+            let bytes = replacement.data()?;
+            let original_bytes = section.data()?;
+            ensure!(
+                original_bytes.is_empty()
+                    || bytes.get(delta as usize..delta as usize + original_bytes.len())
+                        == Some(original_bytes),
+                "rebuild changed section data {name}"
+            );
         }
-        if let Placement::Padding { offset, .. } = self.placement {
+        if let Some((offset, code)) = padding {
             let text = rebuilt
                 .segments()
                 .find(|s| s.name().ok().flatten() == Some("__TEXT"))

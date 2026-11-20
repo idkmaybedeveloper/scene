@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, ops::Range};
 
 use anyhow::{Result, anyhow, bail, ensure};
+use bad64::Op;
 use scene_disasm::arm64::{Insn, target};
 
 use super::emit::{Emitter, Label};
@@ -8,6 +9,7 @@ use super::emit::{Emitter, Label};
 pub struct Function<'a> {
     pub insns: &'a [Insn],
     pub blocks: Vec<Block>,
+    pub entry_patch: u64,
 }
 
 pub struct Block {
@@ -17,37 +19,93 @@ pub struct Block {
 }
 
 pub enum Exit {
-    Return,
+    Raw(u32),
+    Tail(u64),
     Jump(usize),
-    Conditional { word: u32, taken: usize, fallthrough: usize },
+    Call { site: u64, next: usize, bridge: bool },
+    Conditional { word: u32, taken: Destination, fallthrough: usize },
+}
+
+#[derive(Clone, Copy)]
+pub enum Destination {
+    Block(usize),
+    Address(u64),
 }
 
 impl Exit {
-    pub fn emit(&self, out: &mut Emitter, labels: &[Label]) -> Result<()> {
+    pub fn emit(&self, out: &mut Emitter, labels: &[Label]) {
         match *self {
-            Self::Return => out.ret(),
+            Self::Raw(word) => out.raw(word),
+            Self::Tail(address) => out.jump_to(address),
             Self::Jump(next) => out.jump(labels[next]),
+            Self::Call { site, next, bridge } => {
+                out.jump_to(site);
+                if bridge {
+                    out.resume(site + 4);
+                    out.jump(labels[next]);
+                }
+            }
             Self::Conditional { word, taken, fallthrough } => {
-                out.branch(word, labels[taken]);
+                match taken {
+                    Destination::Block(next) => out.branch(word, labels[next]),
+                    Destination::Address(address) => {
+                        let edge = out.label();
+                        out.branch(word, edge);
+                        out.jump(labels[fallthrough]);
+                        out.bind(edge);
+                        out.jump_to(address);
+                        return;
+                    }
+                }
                 out.jump(labels[fallthrough]);
             }
         }
-        Ok(())
     }
 }
 
 enum Control {
-    Return,
+    Stop(u32),
+    Call,
     Jump(u64),
     Conditional(u64),
     None,
 }
 
+fn is_call(op: Op) -> bool {
+    matches!(op, Op::BL | Op::BLR | Op::BLRAA | Op::BLRAAZ | Op::BLRAB | Op::BLRABZ)
+}
+
 fn control(insn: &Insn) -> Result<Control> {
     let word = insn.word;
     ensure!(word & 0x3F00_0000 != 0x0800_0000, "exclusive/ordered accesses are unsupported");
-    if word == 0xD65F_03C0 {
-        return Ok(Control::Return);
+    let decoded = insn.decode().ok_or_else(|| anyhow!("invalid instruction"))?;
+    match decoded.op() {
+        Op::RET
+        | Op::RETAA
+        | Op::RETAB
+        | Op::BR
+        | Op::BRAA
+        | Op::BRAAZ
+        | Op::BRAB
+        | Op::BRABZ
+        | Op::BRK
+        | Op::HLT => return Ok(Control::Stop(word)),
+        op if is_call(op) => return Ok(Control::Call),
+        Op::BTI
+        | Op::PACIASP
+        | Op::PACIBSP
+        | Op::AUTIASP
+        | Op::AUTIBSP
+        | Op::PACIA1716
+        | Op::PACIB1716
+        | Op::AUTIA1716
+        | Op::AUTIB1716
+        | Op::PACIAZ
+        | Op::PACIBZ
+        | Op::AUTIAZ
+        | Op::AUTIBZ
+        | Op::XPACLRI => return Ok(Control::None),
+        _ => {}
     }
     if word & 0xFC00_0000 == 0x1400_0000 {
         return Ok(Control::Jump(target(word, insn.address).unwrap()));
@@ -58,6 +116,10 @@ fn control(insn: &Insn) -> Result<Control> {
     {
         return Ok(Control::Conditional(target(word, insn.address).unwrap()));
     }
+    if word & 0xFFFF_F0FF == 0xD503_30BF || word & 0xFFFF_F0FF == 0xD503_309F || word == 0xD503_3FDF
+    {
+        return Ok(Control::None);
+    }
     if word & 0x1C00_0000 == 0x1400_0000
         && ![0xD503_201F, 0xD53B_4200 | (word & 31), 0xD51B_4200 | (word & 31)].contains(&word)
     {
@@ -67,39 +129,68 @@ fn control(insn: &Insn) -> Result<Control> {
     Ok(Control::None)
 }
 
-pub fn reachable_len(insns: &[Insn]) -> Result<usize> {
+fn reachable(insns: &[Insn], allow_unknown: bool) -> Result<BTreeSet<usize>> {
     ensure!(!insns.is_empty(), "empty function");
     let start = insns[0].address;
     let mut pending = vec![0];
     let mut visited = BTreeSet::new();
     while let Some(index) = pending.pop() {
+        if allow_unknown && index >= insns.len() {
+            continue;
+        }
         ensure!(index < insns.len(), "function falls past its end");
         if !visited.insert(index) {
             continue;
         }
         let insn = &insns[index];
         ensure!(insn.address == start + index as u64 * 4, "noncontiguous function");
-        ensure!(!insn.data && insn.decode().is_some(), "data or invalid instruction");
-        let destination = |address: u64| -> Result<usize> {
-            let offset =
-                address.checked_sub(start).ok_or_else(|| anyhow!("branch leaves function"))?;
-            ensure!(
-                offset.is_multiple_of(4) && offset / 4 < insns.len() as u64,
-                "branch leaves function"
-            );
-            Ok((offset / 4) as usize)
-        };
-        match control(insn)? {
-            Control::Return => {}
-            Control::Jump(dst) => pending.push(destination(dst)?),
-            Control::Conditional(dst) => {
-                pending.push(destination(dst)?);
-                pending.push(index + 1);
+        if insn.data || insn.decode().is_none() {
+            ensure!(allow_unknown, "data or invalid instruction");
+            continue;
+        }
+        let flow = match control(insn) {
+            Ok(flow) => flow,
+            Err(_) if allow_unknown => {
+                if insn.word & 0xFFFF_F01F == 0xD503_201F {
+                    pending.push(index + 1);
+                }
+                continue;
             }
-            Control::None => pending.push(index + 1),
+            Err(error) => return Err(error),
+        };
+        match flow {
+            Control::Stop(_) => {}
+            Control::Call if index + 1 == insns.len() => {}
+            Control::Call | Control::None => pending.push(index + 1),
+            Control::Jump(dst) | Control::Conditional(dst) => {
+                if let Some(offset) = dst.checked_sub(start)
+                    && offset.is_multiple_of(4)
+                    && offset / 4 < insns.len() as u64
+                {
+                    pending.push((offset / 4) as usize);
+                }
+                if matches!(flow, Control::Conditional(_)) {
+                    pending.push(index + 1);
+                }
+            }
         }
     }
-    Ok(visited.last().copied().unwrap() + 1)
+    Ok(visited)
+}
+
+pub fn mba_sites(insns: &[Insn]) -> Result<Vec<usize>> {
+    ensure!(
+        !insns.iter().any(|i| !i.data && i.word & 0x3F00_0000 == 0x0800_0000),
+        "exclusive/ordered accesses are unsupported"
+    );
+    Ok(reachable(insns, true)?
+        .into_iter()
+        .filter(|&i| !insns[i].data && insns[i].decode().is_some())
+        .collect())
+}
+
+pub fn reachable_len(insns: &[Insn]) -> Result<usize> {
+    Ok(reachable(insns, false)?.last().copied().unwrap() + 1)
 }
 
 impl<'a> Function<'a> {
@@ -110,7 +201,11 @@ impl<'a> Function<'a> {
         let end = start
             .checked_add(insns.len() as u64 * 4)
             .ok_or_else(|| anyhow!("function address overflow"))?;
+        let entry_patch =
+            start + if insns[0].decode().is_some_and(|i| i.op() == Op::BTI) { 4 } else { 0 };
+        ensure!(entry_patch < end, "missing entry instruction");
         let mut leaders = BTreeSet::from([0]);
+        let internal = |dst| (start..end).contains(&dst);
         for (i, insn) in insns.iter().enumerate() {
             ensure!(insn.address == start + i as u64 * 4, "noncontiguous function");
             ensure!(
@@ -120,17 +215,22 @@ impl<'a> Function<'a> {
             );
             match control(insn)? {
                 Control::Jump(dst) | Control::Conditional(dst) => {
-                    ensure!(
-                        (start..end).contains(&dst) && dst.is_multiple_of(4),
-                        "{:#x}: branch leaves function ({dst:#x})",
-                        insn.address
-                    );
-                    leaders.insert(((dst - start) / 4) as usize);
+                    if internal(dst) {
+                        ensure!(dst.is_multiple_of(4), "unaligned branch target");
+                        leaders.insert(((dst - start) / 4) as usize);
+                    }
                     if i + 1 < insns.len() {
                         leaders.insert(i + 1);
                     }
                 }
-                Control::Return => {
+                Control::Call => {
+                    ensure!(insn.address != entry_patch, "call overlaps entry trampoline");
+                    if i + 1 == insns.len() {
+                        continue;
+                    }
+                    leaders.insert(i + 1);
+                }
+                Control::Stop(_) => {
                     if i + 1 < insns.len() {
                         leaders.insert(i + 1);
                     }
@@ -138,7 +238,7 @@ impl<'a> Function<'a> {
                 Control::None => {
                     if let Some(dst) = target(insn.word, insn.address) {
                         ensure!(
-                            !(start..end).contains(&dst),
+                            !internal(dst),
                             "{:#x}: pc-relative ref to function interior",
                             insn.address
                         );
@@ -148,19 +248,35 @@ impl<'a> Function<'a> {
         }
         let leaders: Vec<_> = leaders.into_iter().collect();
         let block_at = |address| leaders.binary_search(&((address - start) as usize / 4)).unwrap();
+        let destination = |address| {
+            if internal(address) {
+                Destination::Block(block_at(address))
+            } else {
+                Destination::Address(address)
+            }
+        };
         let mut blocks = Vec::new();
         for (index, &first) in leaders.iter().enumerate() {
             let limit = leaders.get(index + 1).copied().unwrap_or(insns.len());
             let last = &insns[limit - 1];
             let mut body = first..limit - 1;
             let exit = match control(last)? {
-                Control::Return => Exit::Return,
-                Control::Jump(dst) => Exit::Jump(block_at(dst)),
+                Control::Stop(word) => Exit::Raw(word),
+                Control::Jump(dst) => match destination(dst) {
+                    Destination::Block(next) => Exit::Jump(next),
+                    Destination::Address(address) => Exit::Tail(address),
+                },
+                Control::Call if limit == insns.len() => Exit::Tail(last.address),
+                Control::Call => Exit::Call {
+                    site: last.address,
+                    next: index + 1,
+                    bridge: !insns[limit].decode().is_some_and(|i| is_call(i.op())),
+                },
                 Control::Conditional(dst) => {
                     ensure!(limit < insns.len(), "conditional falls past function end");
                     Exit::Conditional {
                         word: last.word,
-                        taken: block_at(dst),
+                        taken: destination(dst),
                         fallthrough: index + 1,
                     }
                 }
@@ -172,6 +288,6 @@ impl<'a> Function<'a> {
             };
             blocks.push(Block { address: insns[first].address, body, exit });
         }
-        Ok(Self { insns, blocks })
+        Ok(Self { insns, blocks, entry_patch })
     }
 }

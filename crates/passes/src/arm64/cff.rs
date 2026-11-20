@@ -3,7 +3,7 @@ use dynasmrt::{DynasmLabelApi, dynasm};
 
 use super::{
     Options,
-    cfg::{Exit, Function},
+    cfg::{Destination, Exit, Function},
     emit::{Emitter, Label},
     emit_body,
 };
@@ -25,14 +25,25 @@ pub fn emit(
         out.bind(labels[index]);
         emit_body(out, &function.insns[block.body.clone()], options.mba)?;
         match block.exit {
-            Exit::Return => out.ret(),
+            Exit::Raw(word) => out.raw(word),
+            Exit::Tail(address) => out.jump_to(address),
             Exit::Jump(next) => transition(out, state(next), key, dispatcher),
+            Exit::Call { site, next, bridge } => {
+                out.jump_to(site);
+                if bridge {
+                    out.resume(site + 4);
+                    transition(out, state(next), key, dispatcher);
+                }
+            }
             Exit::Conditional { word, taken, fallthrough } => {
                 let taken_edge = out.label();
                 out.branch(word, taken_edge);
                 transition(out, state(fallthrough), key, dispatcher);
                 out.bind(taken_edge);
-                transition(out, state(taken), key, dispatcher);
+                match taken {
+                    Destination::Block(next) => transition(out, state(next), key, dispatcher),
+                    Destination::Address(address) => out.jump_to(address),
+                }
             }
         }
     }

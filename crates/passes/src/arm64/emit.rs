@@ -1,6 +1,7 @@
 use anyhow::{Result, ensure};
 use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation, dynasm};
 use scene_disasm::arm64::{Insn, target};
+use std::collections::BTreeMap;
 
 pub use dynasmrt::DynamicLabel as Label;
 
@@ -8,12 +9,18 @@ pub struct Emitter {
     base: u64,
     pub asm: VecAssembler<Aarch64Relocation>,
     pub substitutions: usize,
+    pub resumes: BTreeMap<u64, u64>,
 }
 
 impl Emitter {
     pub fn new(base: u64) -> Result<Self> {
         ensure!(base.is_multiple_of(4), "unaligned output address {base:#x}");
-        Ok(Self { base, asm: VecAssembler::new(base.try_into()?), substitutions: 0 })
+        Ok(Self {
+            base,
+            asm: VecAssembler::new(base.try_into()?),
+            substitutions: 0,
+            resumes: BTreeMap::new(),
+        })
     }
 
     pub fn label(&mut self) -> Label {
@@ -70,8 +77,16 @@ impl Emitter {
         dynasm!(self.asm; .arch aarch64; b =>label);
     }
 
-    pub fn ret(&mut self) {
-        dynasm!(self.asm; .arch aarch64; ret);
+    pub fn jump_to(&mut self, address: u64) {
+        dynasm!(self.asm; .arch aarch64; b extern address as usize);
+    }
+
+    pub fn raw(&mut self, word: u32) {
+        self.asm.extend(word.to_le_bytes());
+    }
+
+    pub fn resume(&mut self, address: u64) {
+        self.resumes.insert(address, self.base + self.asm.offset().0 as u64);
     }
 
     #[allow(clippy::useless_conversion)]
