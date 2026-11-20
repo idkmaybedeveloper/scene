@@ -2757,6 +2757,7 @@ dependencies = [
  "apple-codesign",
  "bad64",
  "clap",
+ "getrandom 0.2.17",
  "leb128",
  "object 0.41.0",
  "scene-asm",

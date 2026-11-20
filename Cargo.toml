@@ -33,3 +33,4 @@ scene-asm.workspace = true
 scene-passes.workspace = true
 apple-codesign.workspace = true
 leb128 = "0.2"
+getrandom = "0.2.17"

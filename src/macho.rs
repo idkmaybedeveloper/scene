@@ -6,6 +6,7 @@ use object::{Endianness, macho, read::macho::LoadCommandVariant};
 
 pub mod functions;
 pub mod layout;
+mod metadata;
 mod sections;
 pub mod strings;
 

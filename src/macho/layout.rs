@@ -5,7 +5,7 @@ use object::{
     macho,
 };
 
-use super::{functions, sections};
+use super::{functions, metadata, sections};
 
 const SEGMENT: &[u8] = b"__SCENE";
 const PAGE_SIZE: u64 = 0x4000;
@@ -136,6 +136,7 @@ impl CodeLayout {
                 );
             }
         }
+        let code_end = self.base + code.len() as u64;
         let padding = match self.placement {
             Placement::Segment => {
                 add_segment(&mut builder, self.base, code)?;
@@ -145,6 +146,7 @@ impl CodeLayout {
         };
         let mut starts = functions::starts(&original)?;
         starts.extend_from_slice(entries);
+        metadata::apply(&mut builder, &mut starts, entries, code_end)?;
         starts.sort_unstable();
         starts.dedup();
         let mut encoded = Vec::new();
