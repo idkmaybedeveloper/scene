@@ -4,6 +4,9 @@ use anyhow::{Result, anyhow};
 use apple_codesign::{MachOSigner, SettingsScope, SigningSettings};
 use object::{Endianness, macho, read::macho::LoadCommandVariant};
 
+pub mod functions;
+pub mod layout;
+
 pub fn data_in_code(file: &object::File) -> Result<Vec<Range<u64>>> {
     let object::File::MachO64(macho) = file else { return Ok(Vec::new()) };
     let endian = macho.endian();
@@ -14,8 +17,7 @@ pub fn data_in_code(file: &object::File) -> Result<Vec<Range<u64>>> {
         if linkedit.cmd.get(endian) != macho::LC_DATA_IN_CODE {
             continue;
         }
-        let start = linkedit.dataoff.get(endian) as usize;
-        let bytes = &macho.data()[start..start + linkedit.datasize.get(endian) as usize];
+        let bytes = linkedit.data(endian, macho.data())?;
         let entries =
             object::pod::slice_from_all_bytes::<macho::DataInCodeEntry<Endianness>>(bytes)
                 .map_err(|_| anyhow!("malformed LC_DATA_IN_CODE"))?;

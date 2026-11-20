@@ -1,12 +1,15 @@
 use std::ops::Range;
 
 use anyhow::{Context, Result, bail, ensure};
-use object::{Architecture, Object, ObjectSection, SectionKind};
+use object::{Architecture, BinaryFormat, Object, ObjectSection, SectionKind};
 use scene_disasm::Arch;
 
 use crate::{macho, passes};
 
 pub fn rewrite(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
+    if file.format() == BinaryFormat::MachO && file.architecture() == Architecture::Aarch64 {
+        return passes::run(file, data, dump);
+    }
     let arch = match file.architecture() {
         Architecture::X86_64 => Arch::X64,
         Architecture::I386 => Arch::X86,
@@ -29,12 +32,11 @@ pub fn rewrite(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> 
             .map(file_to_vaddr)
             .collect();
 
-        let mut listing = scene_disasm::disassemble(arch, &data[range.clone()], base, &data_ranges)
+        let listing = scene_disasm::disassemble(arch, &data[range.clone()], base, &data_ranges)
             .with_context(|| format!("disassembling {name}"))?;
         if dump {
             print!("; {name} @ {base:#x}\n{listing}");
         }
-        passes::run(&mut listing)?;
         let code = scene_asm::assemble(&listing, base, range.len())
             .with_context(|| format!("assembling {name}"))?;
         ensure!(code.len() == range.len());

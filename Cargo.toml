@@ -12,10 +12,11 @@ apple-codesign = { version = "0.29", default-features = false }
 clap = { version = "4.6", features = ["derive"] }
 bad64 = "0.13"
 iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "intel"] }
-object = { version = "0.41", default-features = false, features = ["std", "read"] }
+object = { version = "0.41", default-features = false, features = ["std", "read", "build"] }
 
 scene-disasm = { path = "crates/disasm" }
 scene-asm = { path = "crates/asm" }
+scene-passes = { path = "crates/passes" }
 
 [package]
 name = "scene"
@@ -28,4 +29,6 @@ clap.workspace = true
 object.workspace = true
 scene-disasm.workspace = true
 scene-asm.workspace = true
+scene-passes.workspace = true
 apple-codesign.workspace = true
+leb128 = "0.2"
