@@ -10,6 +10,7 @@ pub struct Emitter {
     pub asm: VecAssembler<Aarch64Relocation>,
     pub substitutions: usize,
     pub resumes: BTreeMap<u64, u64>,
+    pub moved: BTreeMap<u64, u64>,
 }
 
 impl Emitter {
@@ -20,6 +21,7 @@ impl Emitter {
             asm: VecAssembler::new(base.try_into()?),
             substitutions: 0,
             resumes: BTreeMap::new(),
+            moved: BTreeMap::new(),
         })
     }
 
@@ -87,6 +89,10 @@ impl Emitter {
 
     pub fn resume(&mut self, address: u64) {
         self.resumes.insert(address, self.base + self.asm.offset().0 as u64);
+    }
+
+    pub fn record(&mut self, address: u64) {
+        self.moved.insert(address, self.base + self.asm.offset().0 as u64);
     }
 
     #[allow(clippy::useless_conversion)]

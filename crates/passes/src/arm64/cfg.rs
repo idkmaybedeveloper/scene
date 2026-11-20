@@ -16,6 +16,7 @@ pub struct Block {
     pub address: u64,
     pub body: Range<usize>,
     pub exit: Exit,
+    pub exit_address: Option<u64>,
 }
 
 pub enum Exit {
@@ -71,7 +72,7 @@ enum Control {
     None,
 }
 
-fn is_call(op: Op) -> bool {
+pub(super) fn is_call(op: Op) -> bool {
     matches!(op, Op::BL | Op::BLR | Op::BLRAA | Op::BLRAAZ | Op::BLRAB | Op::BLRABZ)
 }
 
@@ -286,7 +287,8 @@ impl<'a> Function<'a> {
                     Exit::Jump(index + 1)
                 }
             };
-            blocks.push(Block { address: insns[first].address, body, exit });
+            let exit_address = (body.end != limit).then_some(last.address);
+            blocks.push(Block { address: insns[first].address, body, exit, exit_address });
         }
         Ok(Self { insns, blocks, entry_patch })
     }

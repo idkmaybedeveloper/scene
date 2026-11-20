@@ -24,6 +24,9 @@ pub fn emit(
         let block = &function.blocks[index];
         out.bind(labels[index]);
         emit_body(out, &function.insns[block.body.clone()], options.mba)?;
+        if let Some(address) = block.exit_address {
+            out.record(address);
+        }
         match block.exit {
             Exit::Raw(word) => out.raw(word),
             Exit::Tail(address) => out.jump_to(address),

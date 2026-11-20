@@ -2,8 +2,9 @@ mod cff;
 mod cfg;
 mod emit;
 mod mba;
+mod relocate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use scene_disasm::arm64::Insn;
@@ -33,6 +34,8 @@ pub struct Output {
     pub block_addresses: BTreeMap<u64, u64>,
     pub resumes: BTreeMap<u64, u64>,
     pub entry_patch: u64,
+    pub moved: BTreeMap<u64, u64>,
+    pub kept: BTreeSet<u64>,
 }
 
 pub fn reachable_len(insns: &[Insn]) -> Result<usize> {
@@ -53,7 +56,8 @@ pub fn substitute(insn: &Insn, base: u64) -> Result<Option<Vec<Insn>>> {
 }
 
 pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> {
-    let function = Function::parse(insns)?;
+    let len = cfg::reachable_len(insns)?;
+    let function = Function::parse(&insns[..len])?;
     let mut emitter = Emitter::new(base)?;
     let labels: Vec<_> = function.blocks.iter().map(|_| emitter.label()).collect();
     if options.cff {
@@ -62,6 +66,9 @@ pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> 
         for (index, block) in function.blocks.iter().enumerate() {
             emitter.bind(labels[index]);
             emit_body(&mut emitter, &insns[block.body.clone()], options.mba)?;
+            if let Some(address) = block.exit_address {
+                emitter.record(address);
+            }
             block.exit.emit(&mut emitter, &labels);
         }
     }
@@ -73,6 +80,13 @@ pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> 
         .collect::<Result<_>>()?;
     let substitutions = emitter.substitutions;
     let resumes = emitter.resumes.clone();
+    relocate::remaining(&mut emitter, insns)?;
+    let moved = emitter.moved.clone();
+    let kept = insns
+        .iter()
+        .filter(|i| i.decode().is_some_and(|d| cfg::is_call(d.op()) || d.op() == bad64::Op::BTI))
+        .map(|i| i.address)
+        .collect();
     Ok(Output {
         insns: emitter.finish()?,
         blocks: function.blocks.len(),
@@ -81,11 +95,14 @@ pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> 
         block_addresses,
         resumes,
         entry_patch: function.entry_patch,
+        moved,
+        kept,
     })
 }
 
 fn emit_body(emitter: &mut Emitter, insns: &[Insn], substitute: bool) -> Result<()> {
     for insn in insns {
+        emitter.record(insn.address);
         if substitute && mba::emit(insn.word, emitter) {
             emitter.substitutions += 1;
         } else {

@@ -3,7 +3,7 @@ use std::ops::Range;
 use anyhow::{Context, Result, ensure};
 use object::{Object, ObjectSection};
 use scene_disasm::{Listing, arm64::Insn};
-use scene_passes::arm64::{Options, mba_sites, reachable_len, substitute, transform};
+use scene_passes::arm64::{Options, mba_sites, substitute, transform};
 
 use crate::macho::{self, functions, layout::CodeLayout};
 
@@ -29,8 +29,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
         let candidate = &insns[function.range.clone()];
         let destination = layout.base + code.len() as u64;
         let converted = (|| -> Result<_> {
-            let len = reachable_len(candidate)?;
-            let candidate = &candidate[..len];
+            let len = candidate.len();
             let start = candidate[0].address;
             let options =
                 Options { seed: Options::default().seed ^ start as u32, ..Options::default() };
@@ -39,14 +38,20 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
                 layout.fits(code.len() + output.insns.len() * 4),
                 "executable padding exhausted"
             );
-            let mut bridges = Vec::with_capacity(output.resumes.len() + 1);
+            let mut bridges = Vec::with_capacity(output.moved.len() + output.resumes.len() + 1);
+            for (&address, &moved) in &output.moved {
+                if !output.kept.contains(&address) {
+                    bridges
+                        .push((address, scene_asm::arm64::retarget(0x1400_0000, address, moved)?));
+                }
+            }
+            for (&address, &resume) in &output.resumes {
+                bridges.push((address, scene_asm::arm64::retarget(0x1400_0000, address, resume)?));
+            }
             bridges.push((
                 output.entry_patch,
                 scene_asm::arm64::retarget(0x1400_0000, output.entry_patch, destination)?,
             ));
-            for (&address, &resume) in &output.resumes {
-                bridges.push((address, scene_asm::arm64::retarget(0x1400_0000, address, resume)?));
-            }
             Ok((len, output, bridges))
         })();
         let (len, output, bridges) = match converted {
