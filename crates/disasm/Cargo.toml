@@ -1,0 +1,9 @@
+[package]
+name = "scene-disasm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bad64.workspace = true
+iced-x86.workspace = true
