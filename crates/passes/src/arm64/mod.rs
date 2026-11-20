@@ -3,6 +3,7 @@ mod cfg;
 mod emit;
 mod mba;
 mod relocate;
+pub mod strings;
 
 use std::collections::{BTreeMap, BTreeSet};
 

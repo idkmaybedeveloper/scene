@@ -7,6 +7,7 @@ use object::{Endianness, macho, read::macho::LoadCommandVariant};
 pub mod functions;
 pub mod layout;
 mod sections;
+pub mod strings;
 
 pub fn data_in_code(file: &object::File) -> Result<Vec<Range<u64>>> {
     let object::File::MachO64(macho) = file else { return Ok(Vec::new()) };

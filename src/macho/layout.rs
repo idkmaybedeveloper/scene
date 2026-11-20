@@ -17,13 +17,16 @@ enum Placement {
 
 pub struct CodeLayout {
     pub base: u64,
+    pub data_base: u64,
     text_base: u64,
     placement: Placement,
     merge_constants: bool,
+    merge_stubs: bool,
+    storage_size: u64,
 }
 
 impl CodeLayout {
-    pub fn new(file: &object::File, data: &[u8]) -> Result<Self> {
+    pub fn new(file: &object::File, data: &[u8], storage_size: usize) -> Result<Self> {
         let object::File::MachO64(image) = file else { anyhow::bail!("expected a 64-bit image") };
         ensure!(image.endian() == Endianness::Little, "unsupported byte order");
         let endian = image.endian();
@@ -64,18 +67,29 @@ impl CodeLayout {
             .min()
             .context("missing section data")?;
         let merge_constants = sections::can_merge_constants(file);
-        let required_end = commands_end.checked_add(152).context("load command size overflow")?;
-        let required_end = required_end - if merge_constants { 80 } else { 0 };
+        let merge_stubs = storage_size != 0 && sections::can_merge_stubs(file);
+        let storage_size = (storage_size as u64 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let saved = 80 * (usize::from(merge_constants) + usize::from(merge_stubs));
+        let extra = if storage_size != 0 { 72 } else { 0 };
+        let required_end =
+            commands_end.checked_add(152 + extra).context("load command size overflow")? - saved;
         if required_end <= first_section
             && data.get(commands_end..first_section).is_some_and(|b| b.iter().all(|&b| b == 0))
         {
             return Ok(Self {
-                base: linkedit.address(),
+                base: linkedit.address() + storage_size,
+                data_base: linkedit.address(),
                 text_base: text.address(),
                 placement: Placement::Segment,
                 merge_constants,
+                merge_stubs,
+                storage_size,
             });
         }
+        ensure!(
+            commands_end + extra <= first_section + saved,
+            "no space for writable string storage"
+        );
         let (text_offset, text_size) = text.file_range();
         let last_section = file
             .sections()
@@ -94,9 +108,12 @@ impl CodeLayout {
         eprintln!("using {} bytes of executable __text padding", padding.len());
         Ok(Self {
             base: text.address() + offset - text_offset,
+            data_base: linkedit.address(),
             text_base: text.address(),
             placement: Placement::Padding { offset: offset as usize, capacity: padding.len() },
-            merge_constants: false,
+            merge_constants: storage_size != 0 && merge_constants,
+            merge_stubs,
+            storage_size,
         })
     }
 
@@ -112,6 +129,12 @@ impl CodeLayout {
         let mut builder = Builder::read(data).context("reading image for rebuild")?;
         if self.merge_constants {
             sections::merge_constants(&mut builder, data)?;
+        }
+        if self.merge_stubs {
+            sections::merge_stubs(&mut builder, data)?;
+        }
+        if self.storage_size != 0 {
+            add_storage(&mut builder, self.data_base, self.storage_size)?;
         }
         for command in &builder.commands {
             if let LoadCommand::Other { cmd, .. } = command {
@@ -235,5 +258,35 @@ fn add_segment(builder: &mut Builder<'_>, base: u64, code: Vec<u8>) -> Result<()
         .position(|c| matches!(c, LoadCommand::Segment(id) if *id == linkedit_id))
         .unwrap();
     builder.commands.insert(index + 1, LoadCommand::Segment(new_linkedit_id));
+    Ok(())
+}
+
+fn add_storage(builder: &mut Builder<'_>, base: u64, size: u64) -> Result<()> {
+    let id = builder
+        .segments
+        .iter()
+        .find(|s| s.segname() == b"__LINKEDIT")
+        .context("missing linkedit")?
+        .id();
+    let segment = builder.segments.get_mut(id);
+    let old_size = segment.vmsize;
+    segment.segname = [0; 16];
+    segment.segname[..12].copy_from_slice(b"__SCENE_DATA");
+    segment.vmsize = size;
+    segment.maxprot = macho::VM_PROT_READ | macho::VM_PROT_WRITE;
+    segment.initprot = segment.maxprot;
+    let segment = builder.segments.add();
+    segment.segname[..10].copy_from_slice(b"__LINKEDIT");
+    segment.vmaddr = base + size;
+    segment.vmsize = old_size;
+    segment.maxprot = macho::VM_PROT_READ;
+    segment.initprot = segment.maxprot;
+    let new_id = segment.id();
+    let at = builder
+        .commands
+        .iter()
+        .position(|c| matches!(c, LoadCommand::Segment(s) if *s == id))
+        .unwrap();
+    builder.commands.insert(at + 1, LoadCommand::Segment(new_id));
     Ok(())
 }

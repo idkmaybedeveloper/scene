@@ -5,19 +5,21 @@ use object::{Object, ObjectSection};
 use scene_disasm::{Listing, arm64::Insn};
 use scene_passes::arm64::{Options, mba_sites, substitute, transform};
 
-use crate::macho::{self, functions, layout::CodeLayout};
+use crate::macho::{self, functions, layout::CodeLayout, strings::Strings};
 
 mod report;
 use report::Report;
 
 pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
-    let layout = CodeLayout::new(file, data)?;
     let section = file.section_by_name("__text").context("missing __text section")?;
     let (offset, size) = section.file_range().context("__text has no file data")?;
     let base = section.address();
     let functions = functions::in_text(file, base, size)?;
     let dice = macho::data_in_code(file)?;
     let insns = decode(section.data()?, base, offset, &dice)?;
+    let strings = Strings::collect(file, &insns, &functions)?;
+    let layout = CodeLayout::new(file, data, strings.storage_size())?;
+    let mut moved = std::collections::BTreeMap::new();
     if dump {
         print!("; __text @ {base:#x}\n{}", Listing::Arm64(insns.clone()));
     }
@@ -25,7 +27,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
     let mut code = Vec::new();
     let mut entries = Vec::new();
     let mut report = Report::default();
-    for function in functions {
+    for function in &functions {
         let candidate = &insns[function.range.clone()];
         let destination = layout.base + code.len() as u64;
         let converted = (|| -> Result<_> {
@@ -90,6 +92,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
             }
         };
         apply(&mut out, offset, base, bridges);
+        moved.extend(&output.moved);
         let code_size = output.insns.len() * 4;
         if dump {
             eprintln!(
@@ -110,6 +113,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
         entries.push(destination);
         report.cff += 1;
     }
+    strings.apply(file, &mut out, &mut code, &layout, &moved, &insns, &functions, &mut entries)?;
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible instructions to transform");
     layout.finish(&out, code, &entries)

@@ -60,3 +60,45 @@ pub fn merge_constants<'a>(builder: &mut Builder<'a>, data: &'a [u8]) -> Result<
     }
     Ok(())
 }
+
+pub fn can_merge_stubs(file: &object::File) -> bool {
+    let sections: Vec<_> =
+        file.sections().filter(|s| s.segment_name().ok().flatten() == Some("__TEXT")).collect();
+    sections
+        .windows(2)
+        .any(|s| s[0].name().ok() == Some("__text") && s[1].name().ok() == Some("__stubs"))
+}
+
+pub fn merge_stubs<'a>(builder: &mut Builder<'a>, data: &'a [u8]) -> Result<()> {
+    let image = object::File::parse(data)?;
+    let section = image.section_by_name("__text").context("missing code")?;
+    let (offset, _) = section.file_range().context("code has no file data")?;
+    let ids: Vec<_> = builder
+        .sections
+        .iter()
+        .filter(|s| {
+            s.segname() == b"__TEXT" && [b"__text".as_slice(), b"__stubs"].contains(&s.sectname())
+        })
+        .map(|s| s.id())
+        .collect();
+    ensure!(ids.len() == 2, "ambiguous code sections");
+    let first = ids[0];
+    let second = ids[1];
+    let start = builder.sections.get(first).addr;
+    let end = builder.sections.get(second).addr + builder.sections.get(second).data.size() as u64;
+    builder.sections.get_mut(first).data = SectionData::Data(
+        data.get(offset as usize..(offset + end - start) as usize)
+            .context("invalid stub range")?
+            .into(),
+    );
+    builder.sections.get_mut(second).delete = true;
+    for symbol in &mut builder.symbols {
+        if symbol.section == Some(second) {
+            symbol.section = Some(first);
+        }
+    }
+    for segment in &mut builder.segments {
+        segment.sections.retain(|&id| id != second);
+    }
+    Ok(())
+}
