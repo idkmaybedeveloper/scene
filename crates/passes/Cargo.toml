@@ -1,0 +1,11 @@
+[package]
+name = "scene-passes"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+scene-disasm.workspace = true
+scene-asm.workspace = true
+dynasmrt = "5.1"
+
