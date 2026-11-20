@@ -140,7 +140,11 @@ impl Strings {
                 data: false,
             };
             let base = layout.base + code.len() as u64;
-            code.extend(native::guard(base, layout.data_base, initialize, &original)?);
+            code.extend(
+                native::guard(base, layout.data_base, initialize, &original).with_context(
+                    || format!("relocating entry at {:#x}: {word:08x}", first.address),
+                )?,
+            );
             entries.push(base);
             patch(file, out, code, layout.base, first.address, base)?;
         }

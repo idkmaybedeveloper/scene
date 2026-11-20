@@ -20,8 +20,7 @@ pub struct CodeLayout {
     pub data_base: u64,
     text_base: u64,
     placement: Placement,
-    merge_constants: bool,
-    merge_stubs: bool,
+    merge_sections: bool,
     storage_size: u64,
 }
 
@@ -66,10 +65,8 @@ impl CodeLayout {
             .map(|(o, _)| o as usize)
             .min()
             .context("missing section data")?;
-        let merge_constants = sections::can_merge_constants(file);
-        let merge_stubs = storage_size != 0 && sections::can_merge_stubs(file);
+        let saved = sections::header_savings(file);
         let storage_size = (storage_size as u64 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let saved = 80 * (usize::from(merge_constants) + usize::from(merge_stubs));
         let extra = if storage_size != 0 { 72 } else { 0 };
         let required_end =
             commands_end.checked_add(152 + extra).context("load command size overflow")? - saved;
@@ -81,8 +78,7 @@ impl CodeLayout {
                 data_base: linkedit.address(),
                 text_base: text.address(),
                 placement: Placement::Segment,
-                merge_constants,
-                merge_stubs,
+                merge_sections: saved != 0,
                 storage_size,
             });
         }
@@ -111,8 +107,7 @@ impl CodeLayout {
             data_base: linkedit.address(),
             text_base: text.address(),
             placement: Placement::Padding { offset: offset as usize, capacity: padding.len() },
-            merge_constants: storage_size != 0 && merge_constants,
-            merge_stubs,
+            merge_sections: saved != 0,
             storage_size,
         })
     }
@@ -127,11 +122,8 @@ impl CodeLayout {
     pub fn finish(self, data: &[u8], code: Vec<u8>, entries: &[u64]) -> Result<Vec<u8>> {
         let original = object::File::parse(data)?;
         let mut builder = Builder::read(data).context("reading image for rebuild")?;
-        if self.merge_constants {
-            sections::merge_constants(&mut builder, data)?;
-        }
-        if self.merge_stubs {
-            sections::merge_stubs(&mut builder, data)?;
+        if self.merge_sections {
+            sections::merge(&mut builder, data)?;
         }
         if self.storage_size != 0 {
             add_storage(&mut builder, self.data_base, self.storage_size)?;

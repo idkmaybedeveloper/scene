@@ -178,15 +178,53 @@ pub fn guard(base: u64, state: u64, initialize: u64, original: &Insn) -> Result<
         asm.extend((original.word & !0x0020_0000).to_le_bytes());
     } else {
         let at = base + asm.offset().0 as u64;
-        let word = match scene_disasm::arm64::target(original.word, original.address) {
-            Some(target) => scene_asm::arm64::retarget(original.word, at, target)?,
-            None => original.word,
-        };
-        asm.extend(word.to_le_bytes());
         let resume = original.address + 4;
-        dynasm!(asm; .arch aarch64; b extern resume as usize);
+        if let Some(target) = scene_disasm::arm64::target(original.word, original.address) {
+            relocate_entry(&mut asm, original.word, at, target, resume)?;
+        } else {
+            asm.extend(original.word.to_le_bytes());
+            dynasm!(asm; .arch aarch64; b extern resume as usize);
+        }
     }
     Ok(asm.finalize()?)
+}
+
+#[allow(clippy::useless_conversion)]
+fn relocate_entry(asm: &mut Assembler, word: u32, at: u64, target: u64, resume: u64) -> Result<()> {
+    if word & 0xFF00_0010 == 0x5400_0000
+        || word & 0x7E00_0000 == 0x3400_0000
+        || word & 0x7E00_0000 == 0x3600_0000
+    {
+        asm.extend(scene_asm::arm64::retarget(word, at, at + 8)?.to_le_bytes());
+        dynasm!(asm; .arch aarch64; b extern resume as usize; b extern target as usize);
+        return Ok(());
+    }
+    if word & 0x9F00_0000 == 0x1000_0000 {
+        if word & 31 != 31 {
+            address(asm, (word & 31) as u8, target);
+        }
+    } else if word & 0x3B00_0000 == 0x1800_0000 {
+        let register = (word & 31) as u8;
+        let scratch = if register == 16 { 17 } else { 16 };
+        dynasm!(asm; .arch aarch64; str X(scratch), [sp, -144]!);
+        address(asm, scratch, target);
+        let load = match (word >> 26 & 1, word >> 30) {
+            (0, 0) => 0xB940_0000,
+            (0, 1) => 0xF940_0000,
+            (0, 2) => 0xB980_0000,
+            (0, 3) => 0xF980_0000,
+            (1, 0) => 0xBD40_0000,
+            (1, 1) => 0xFD40_0000,
+            (1, 2) => 0x3DC0_0000,
+            _ => anyhow::bail!("invalid literal load"),
+        };
+        asm.extend((load | (scratch as u32) << 5 | register as u32).to_le_bytes());
+        dynasm!(asm; .arch aarch64; ldr X(scratch), [sp], 144);
+    } else {
+        asm.extend(scene_asm::arm64::retarget(word, at, target)?.to_le_bytes());
+    }
+    dynasm!(asm; .arch aarch64; b extern resume as usize);
+    Ok(())
 }
 
 pub fn reference(base: u64, register: u8, target: u64, resume: u64) -> Result<Vec<u8>> {

@@ -4,101 +4,74 @@ use object::{
     build::macho::{Builder, SectionData},
 };
 
-pub fn can_merge_constants(file: &object::File) -> bool {
-    let sections: Vec<_> =
-        file.sections().filter(|s| s.segment_name().ok().flatten() == Some("__TEXT")).collect();
-    sections.windows(2).any(|s| {
-        s[0].name().ok() == Some("__const") && s[1].name().ok() == Some("__gcc_except_tab")
-    })
-}
+const GROUPS: &[&[&[u8]]] = &[
+    &[b"__text", b"__stubs", b"__auth_stubs", b"__stub_helper"],
+    &[b"__const", b"__gcc_except_tab", b"__cstring"],
+];
 
-pub fn merge_constants<'a>(builder: &mut Builder<'a>, data: &'a [u8]) -> Result<()> {
-    let image = object::File::parse(data)?;
-    let section = image
-        .sections()
-        .find(|s| {
-            s.segment_name().ok().flatten() == Some("__TEXT") && s.name().ok() == Some("__const")
-        })
-        .context("missing constants")?;
-    let (offset, _) = section.file_range().context("constants have no file data")?;
-    let ids: Vec<_> = builder
-        .sections
-        .iter()
-        .filter(|s| {
-            s.segname() == b"__TEXT"
-                && [b"__const".as_slice(), b"__gcc_except_tab"].contains(&s.sectname())
-        })
-        .map(|s| s.id())
-        .collect();
-    ensure!(ids.len() == 2, "ambiguous constant sections");
-    let first = ids[0];
-    let second = ids[1];
-    let left = builder.sections.get(first);
-    let right = builder.sections.get(second);
-    ensure!(
-        left.sectname() == b"__const"
-            && right.sectname() == b"__gcc_except_tab"
-            && left.addr + left.data.size() as u64 <= right.addr,
-        "constant sections overlap or are out of order"
-    );
-    ensure!(
-        left.relocations.is_empty() && right.relocations.is_empty(),
-        "constant sections contain relocations"
-    );
-    let size = right.addr + right.data.size() as u64 - left.addr;
-    let bytes =
-        data.get(offset as usize..(offset + size) as usize).context("invalid constant range")?;
-    builder.sections.get_mut(first).data = SectionData::Data(bytes.into());
-    builder.sections.get_mut(second).delete = true;
-    for symbol in &mut builder.symbols {
-        if symbol.section == Some(second) {
-            symbol.section = Some(first);
+fn groups(file: &object::File) -> Vec<Vec<Vec<u8>>> {
+    let mut groups = Vec::new();
+    for names in GROUPS {
+        let mut run = Vec::new();
+        for section in file.sections() {
+            let name = section.name_bytes().unwrap_or_default();
+            if section.segment_name().ok().flatten() == Some("__TEXT") && names.contains(&name) {
+                run.push(name.to_vec());
+            } else {
+                if run.len() > 1 {
+                    groups.push(std::mem::take(&mut run));
+                }
+                run.clear();
+            }
+        }
+        if run.len() > 1 {
+            groups.push(run);
         }
     }
-    for segment in &mut builder.segments {
-        segment.sections.retain(|&id| id != second);
-    }
-    Ok(())
+    groups
 }
 
-pub fn can_merge_stubs(file: &object::File) -> bool {
-    let sections: Vec<_> =
-        file.sections().filter(|s| s.segment_name().ok().flatten() == Some("__TEXT")).collect();
-    sections
-        .windows(2)
-        .any(|s| s[0].name().ok() == Some("__text") && s[1].name().ok() == Some("__stubs"))
+pub fn header_savings(file: &object::File) -> usize {
+    groups(file).iter().map(|g| (g.len() - 1) * 80).sum()
 }
 
-pub fn merge_stubs<'a>(builder: &mut Builder<'a>, data: &'a [u8]) -> Result<()> {
+pub fn merge(builder: &mut Builder<'_>, data: &[u8]) -> Result<()> {
     let image = object::File::parse(data)?;
-    let section = image.section_by_name("__text").context("missing code")?;
-    let (offset, _) = section.file_range().context("code has no file data")?;
-    let ids: Vec<_> = builder
-        .sections
-        .iter()
-        .filter(|s| {
-            s.segname() == b"__TEXT" && [b"__text".as_slice(), b"__stubs"].contains(&s.sectname())
-        })
-        .map(|s| s.id())
-        .collect();
-    ensure!(ids.len() == 2, "ambiguous code sections");
-    let first = ids[0];
-    let second = ids[1];
-    let start = builder.sections.get(first).addr;
-    let end = builder.sections.get(second).addr + builder.sections.get(second).data.size() as u64;
-    builder.sections.get_mut(first).data = SectionData::Data(
-        data.get(offset as usize..(offset + end - start) as usize)
-            .context("invalid stub range")?
-            .into(),
-    );
-    builder.sections.get_mut(second).delete = true;
-    for symbol in &mut builder.symbols {
-        if symbol.section == Some(second) {
-            symbol.section = Some(first);
+    for names in groups(&image) {
+        let ids: Vec<_> = builder
+            .sections
+            .iter()
+            .filter(|s| s.segname() == b"__TEXT" && names.iter().any(|n| n == s.sectname()))
+            .map(|s| s.id())
+            .collect();
+        ensure!(ids.len() == names.len(), "ambiguous section group");
+        let first = ids[0];
+        let section =
+            image.section_by_name(std::str::from_utf8(&names[0])?).context("missing section")?;
+        let (offset, _) = section.file_range().context("section has no file data")?;
+        let start = section.address();
+        let mut end = start;
+        for &id in &ids {
+            let section = builder.sections.get(id);
+            ensure!(section.relocations.is_empty(), "section contains relocations");
+            ensure!(section.addr >= end, "sections overlap or are out of order");
+            end = section.addr + section.data.size() as u64;
         }
-    }
-    for segment in &mut builder.segments {
-        segment.sections.retain(|&id| id != second);
+        let bytes = data
+            .get(offset as usize..(offset + end - start) as usize)
+            .context("invalid section range")?;
+        builder.sections.get_mut(first).data = SectionData::Data(bytes.to_vec().into());
+        for &id in &ids[1..] {
+            builder.sections.get_mut(id).delete = true;
+            for symbol in &mut builder.symbols {
+                if symbol.section == Some(id) {
+                    symbol.section = Some(first);
+                }
+            }
+            for segment in &mut builder.segments {
+                segment.sections.retain(|&section| section != id);
+            }
+        }
     }
     Ok(())
 }

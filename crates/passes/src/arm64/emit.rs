@@ -11,6 +11,7 @@ pub struct Emitter {
     pub substitutions: usize,
     pub resumes: BTreeMap<u64, u64>,
     pub moved: BTreeMap<u64, u64>,
+    vectors: BTreeMap<[u8; 16], Label>,
 }
 
 impl Emitter {
@@ -22,6 +23,7 @@ impl Emitter {
             substitutions: 0,
             resumes: BTreeMap::new(),
             moved: BTreeMap::new(),
+            vectors: BTreeMap::new(),
         })
     }
 
@@ -95,15 +97,6 @@ impl Emitter {
         self.moved.insert(address, self.base + self.asm.offset().0 as u64);
     }
 
-    #[allow(clippy::useless_conversion)]
-    pub fn constant(&mut self, reg: u8, value: u32) {
-        dynasm!(self.asm
-            ; .arch aarch64
-            ; movz X(reg), value & 0xFFFF
-            ; movk X(reg), value >> 16, LSL 16
-        );
-    }
-
     pub fn original(&mut self, insn: &Insn) -> Result<()> {
         let pc = self.base + self.asm.offset().0 as u64;
         let word = match target(insn.word, insn.address) {
@@ -114,7 +107,24 @@ impl Emitter {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<Vec<Insn>> {
-        scene_disasm::arm64::decode(&self.asm.finalize()?, self.base, |_| false)
+    #[allow(clippy::useless_conversion)]
+    pub fn vector(&mut self, register: u8, value: [u8; 16]) {
+        let label = if let Some(&label) = self.vectors.get(&value) {
+            label
+        } else {
+            let label = self.label();
+            self.vectors.insert(value, label);
+            label
+        };
+        dynasm!(self.asm; .arch aarch64; ldr Q(register), =>label);
+    }
+
+    pub fn finish(mut self) -> Result<Vec<Insn>> {
+        let data = self.base + self.asm.offset().0 as u64;
+        for (value, label) in std::mem::take(&mut self.vectors) {
+            self.bind(label);
+            self.asm.extend(value);
+        }
+        scene_disasm::arm64::decode(&self.asm.finalize()?, self.base, |r| r.start >= data)
     }
 }

@@ -32,7 +32,7 @@ impl EncryptedString {
             }
             let word = [round_key[13], round_key[14], round_key[15], round_key[12]];
             let mut subword = Block::default();
-            for column in subword.chunks_exact_mut(4) {
+            for column in subword.as_chunks_mut::<4>().0 {
                 column.copy_from_slice(&word);
             }
             // ref: https://doi.org/10.6028/NIST.FIPS.197-upd1
