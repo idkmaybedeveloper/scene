@@ -38,6 +38,7 @@ pub struct Rewrite<'a, 'data> {
     pub insns: &'a [Insn],
     pub functions: &'a [Function],
     pub entries: &'a mut Vec<u64>,
+    pub virtualized: &'a std::collections::BTreeSet<u64>,
 }
 
 impl Strings {
@@ -107,8 +108,16 @@ impl Strings {
             .then(|| layout.data_base + 16 + target - self.section.start)
     }
 
+    pub fn vm_addresses(&self, layout: &CodeLayout) -> BTreeMap<u64, u64> {
+        self.references
+            .iter()
+            .filter_map(|r| Some((r.instruction, self.output(r.target, layout)?)))
+            .collect()
+    }
+
     pub fn apply(mut self, rewrite: Rewrite<'_, '_>) -> Result<()> {
-        let Rewrite { file, out, code, layout, moved, insns, functions, entries } = rewrite;
+        let Rewrite { file, out, code, layout, moved, insns, functions, entries, virtualized } =
+            rewrite;
         if layout.in_text_padding() {
             self.constants.exclude_code_padding(layout.base);
         }
@@ -144,11 +153,15 @@ impl Strings {
         code.extend(native::initializer(
             initialize,
             layout.data_base,
+            layout.storage_size,
             &decoders,
             &self.constants.pages,
         )?);
         entries.push(initialize);
         for reference in &self.references {
+            if virtualized.contains(&reference.instruction) {
+                continue;
+            }
             let Some(output) = self.output(reference.target, layout) else { continue };
             let instruction =
                 moved.get(&reference.instruction).copied().unwrap_or(reference.instruction);

@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, ops::Range};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use bad64::Op;
-use scene_disasm::arm64::{Insn, target};
+use scene_disasm::arm64::{Insn, is_conditional_branch, target};
 
 use super::emit::{Emitter, Label};
 
@@ -108,13 +108,10 @@ fn control(insn: &Insn) -> Result<Control> {
         | Op::XPACLRI => return Ok(Control::None),
         _ => {}
     }
-    if word & 0xFC00_0000 == 0x1400_0000 {
+    if decoded.op() == Op::B {
         return Ok(Control::Jump(target(word, insn.address).unwrap()));
     }
-    if word & 0xFF00_0010 == 0x5400_0000
-        || word & 0x7E00_0000 == 0x3400_0000
-        || word & 0x7E00_0000 == 0x3600_0000
-    {
+    if is_conditional_branch(decoded.op()) {
         return Ok(Control::Conditional(target(word, insn.address).unwrap()));
     }
     if word & 0xFFFF_F0FF == 0xD503_30BF || word & 0xFFFF_F0FF == 0xD503_309F || word == 0xD503_3FDF

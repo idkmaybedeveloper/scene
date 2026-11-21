@@ -17,6 +17,12 @@ pub enum Kind {
     Bit,
     Return,
     Nop,
+    Address,
+    Call,
+    Load,
+    Store,
+    LoadPair,
+    StorePair,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -26,6 +32,7 @@ pub struct Opcode {
     pub flags: bool,
 }
 
+#[derive(Clone)]
 pub struct Record {
     pub opcode: Opcode,
     pub dst: u8,
@@ -66,6 +73,18 @@ impl std::fmt::Display for Record {
             ),
             Kind::Return => f.write_str("exit -> ret x30"),
             Kind::Nop => f.write_str("nop"),
+            Kind::Address => write!(f, "addr v{}, bytecode_base + {:#x}", self.dst, self.immediate),
+            Kind::Call => write!(f, "call native site #{}", self.immediate),
+            Kind::Load | Kind::Store => write!(
+                f,
+                "{:?}.{width} v{}, [v{}, {:+#x}]",
+                self.opcode.kind, self.dst, self.lhs, self.immediate as i64
+            ),
+            Kind::LoadPair | Kind::StorePair => write!(
+                f,
+                "{:?}.{width} v{}, v{}, [v{}, {:+#x}]",
+                self.opcode.kind, self.dst, self.rhs, self.lhs, self.immediate as i64
+            ),
             Kind::Move | Kind::Keep => write!(
                 f,
                 "{:?}.{width} v{}, {:#x}, shift={}",
@@ -92,12 +111,12 @@ impl std::fmt::Display for Record {
 }
 
 impl Record {
-    pub fn new(kind: Kind, word: u32) -> Self {
+    pub fn new(kind: Kind, wide: bool) -> Self {
         Self {
-            opcode: Opcode { kind, wide: word >> 31 != 0, flags: false },
-            dst: (word & 31) as u8,
-            lhs: (word >> 5 & 31) as u8,
-            rhs: (word >> 16 & 31) as u8,
+            opcode: Opcode { kind, wide, flags: false },
+            dst: 0,
+            lhs: 31,
+            rhs: 31,
             aux: 0,
             immediate: 0,
             target: None,

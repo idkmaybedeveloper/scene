@@ -5,7 +5,11 @@ use std::{
 
 use anyhow::{Result, ensure};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind};
-use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+use rand::{
+    SeedableRng,
+    rngs::StdRng,
+    seq::{IteratorRandom, SliceRandom},
+};
 use scene_disasm::arm64::Insn;
 
 use super::report::Report;
@@ -118,4 +122,43 @@ pub fn display_name(name: &str) -> String {
         Ok(name) => format!("{name:#}"),
         Err(_) => name.strip_prefix('_').unwrap_or(name).to_owned(),
     }
+}
+
+pub fn anchors(insns: &[Insn], seed: u32) -> Vec<u64> {
+    insns
+        .iter()
+        .filter(|i| !i.data)
+        .map(|i| i.address)
+        .choose_multiple(&mut StdRng::seed_from_u64(u64::from(seed)), 16)
+}
+
+pub struct Pending {
+    pub range: Range<usize>,
+    pub binding: scene_passes::arm64::vm::Binding,
+}
+
+pub fn seal(
+    code: &mut [u8],
+    pending: Vec<Pending>,
+    image: &[u8],
+    offset: u64,
+    base: u64,
+) -> Result<()> {
+    let mut count = 0;
+    for vm in pending {
+        count += vm.binding.anchors.len();
+        vm.binding.seal(&mut code[vm.range], |address| {
+            let at = (offset + address - base) as usize;
+            Ok(u32::from_le_bytes(
+                image
+                    .get(at..at + 4)
+                    .ok_or_else(|| anyhow::anyhow!("vm: anchor outside image"))?
+                    .try_into()?,
+            ))
+        })?;
+    }
+    if count != 0 {
+        log::info!("vm: bound bytecode keys to {count} final code words");
+    }
+    Ok(())
 }

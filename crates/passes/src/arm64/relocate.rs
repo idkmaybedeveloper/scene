@@ -1,5 +1,6 @@
 use anyhow::Result;
-use scene_disasm::arm64::{Insn, target};
+use bad64::{Op, Operand};
+use scene_disasm::arm64::{Insn, is_conditional_branch, label, target};
 
 use super::{cfg, emit::Emitter};
 
@@ -7,16 +8,16 @@ pub fn remaining(out: &mut Emitter, insns: &[Insn]) -> Result<()> {
     let literals: Vec<_> = insns
         .iter()
         .filter_map(|insn| {
-            if insn.data || insn.word & 0x3B00_0000 != 0x1800_0000 {
+            if insn.data {
                 return None;
             }
-            let size = match (insn.word >> 26 & 1, insn.word >> 30) {
-                (0, 0 | 2) | (1, 0) => 4,
-                (0, 1) | (1, 1) => 8,
-                (1, 2) => 16,
+            let decoded = insn.decode()?;
+            let size = match (decoded.op(), decoded.operands()) {
+                (Op::LDR, [Operand::Reg { reg, .. }, Operand::Label(_)]) => reg.size() as u64,
+                (Op::LDRSW, [_, Operand::Label(_)]) => 4,
                 _ => return None,
             };
-            let start = target(insn.word, insn.address)?;
+            let start = label(&decoded)?;
             Some(start..start.saturating_add(size))
         })
         .collect();
@@ -35,10 +36,7 @@ pub fn remaining(out: &mut Emitter, insns: &[Insn]) -> Result<()> {
             continue;
         }
         let word = insn.word;
-        if word & 0xFF00_0010 == 0x5400_0000
-            || word & 0x7E00_0000 == 0x3400_0000
-            || word & 0x7E00_0000 == 0x3600_0000
-        {
+        if is_conditional_branch(decoded.op()) {
             let taken = out.label();
             out.branch(word, taken);
             out.jump_to(insn.address + 4);

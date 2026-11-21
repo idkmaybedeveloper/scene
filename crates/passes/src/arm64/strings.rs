@@ -98,6 +98,7 @@ pub fn decoder(value: &EncryptedString, source: u64, output: u64, base: u64) -> 
 pub fn initializer(
     base: u64,
     state: u64,
+    storage_size: u64,
     decoders: &[u64],
     pages: &[Range<u64>],
 ) -> Result<Vec<u8>> {
@@ -120,6 +121,8 @@ pub fn initializer(
         ; stp q0, q1, [sp, 144]
         ; stp q2, q3, [sp, 176]
     );
+    protect(&mut asm, &(state..state + storage_size), VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    dynasm!(asm; .arch aarch64; cbnz w0, =>failed);
     address(&mut asm, 16, state);
     dynasm!(asm
         ; .arch aarch64
@@ -238,9 +241,9 @@ pub fn guard(base: u64, state: u64, initialize: u64, original: &Insn) -> Result<
 
 #[allow(clippy::useless_conversion)]
 fn relocate_entry(asm: &mut Assembler, word: u32, at: u64, target: u64, resume: u64) -> Result<()> {
-    if word & 0xFF00_0010 == 0x5400_0000
-        || word & 0x7E00_0000 == 0x3400_0000
-        || word & 0x7E00_0000 == 0x3600_0000
+    if bad64::decode(word, at)
+        .ok()
+        .is_some_and(|d| scene_disasm::arm64::is_conditional_branch(d.op()))
     {
         asm.extend(scene_asm::arm64::retarget(word, at, at + 8)?.to_le_bytes());
         dynasm!(asm; .arch aarch64; b extern resume as usize; b extern target as usize);

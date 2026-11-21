@@ -36,6 +36,8 @@ pub fn run(
         vm::select(file, &insns, &functions, &dice, &passes.vm, passes.seed, &mut report)?;
     let strings = Strings::collect(file, &insns, &functions, passes.strings)?;
     let layout = CodeLayout::new(file, data, strings.storage_size())?;
+    let vm_addresses = strings.vm_addresses(&layout);
+    let mut virtualized = std::collections::BTreeSet::new();
     let mut moved = std::collections::BTreeMap::new();
     if dump {
         print!("; __text @ {base:#x}\n{}", Listing::Arm64(insns.clone()));
@@ -44,6 +46,7 @@ pub fn run(
     let mut code = Vec::new();
     let mut entries = Vec::new();
     let mut protected = Vec::new();
+    let mut bindings = Vec::new();
     let hook = banner_hook(file, &functions, base, offset, size, banner_into);
     let mut main_hook: Option<(u64, u64)> = None;
     for (index, function) in functions.iter().enumerate() {
@@ -52,10 +55,19 @@ pub fn run(
             let destination = layout.base + code.len() as u64;
             let converted = (|| -> Result<_> {
                 let start = candidate[0].address;
-                let output = scene_passes::arm64::vm::transform(
+                let seed = passes.seed ^ start as u32;
+                let output = scene_passes::arm64::vm::transform_with_options(
                     candidate,
                     destination,
-                    passes.seed ^ start as u32,
+                    scene_passes::arm64::vm::Options {
+                        seed,
+                        anchors: vm::anchors(&insns, seed),
+                        addresses: vm_addresses
+                            .range(start..start + candidate.len() as u64 * 4)
+                            .map(|(&a, &b)| (a, b))
+                            .collect(),
+                        ..Default::default()
+                    },
                 )?;
                 ensure!(
                     layout.fits(code.len() + output.code.len()),
@@ -71,6 +83,7 @@ pub fn run(
                         .sources
                         .iter()
                         .copied()
+                        .filter(|address| !output.kept.contains(address))
                         .filter(|&address| {
                             address != candidate[0].address || address == output.entry_patch
                         })
@@ -82,16 +95,27 @@ pub fn run(
                         })
                         .collect();
                     apply(&mut out, offset, base, patches);
+                    for (&site, &resume) in &output.resumes {
+                        apply(
+                            &mut out,
+                            offset,
+                            base,
+                            vec![(site, scene_asm::arm64::retarget(0x1400_0000, site, resume)?)],
+                        );
+                    }
+                    virtualized.extend(output.sources.iter().copied());
+                    entries.extend(output.resumes.values().copied());
                     if Some(candidate[0].address) == hook {
                         main_hook = Some((output.entry_patch, destination));
                     }
                     if dump {
                         log::info!(
-                            "{}: vm at {destination:#x}, {} instructions, {} bytecode bytes, {} total bytes",
+                            "{}: vm at {destination:#x}, {} instructions, {} bytecode bytes, {} total bytes, mutant {:#x}",
                             function.name,
                             output.instructions,
                             output.bytecode.len(),
-                            output.code.len()
+                            output.code.len(),
+                            output.mutation_seed
                         );
                         print!("; vm {} @ {destination:#x}\n{output}", function.name);
                     }
@@ -100,8 +124,16 @@ pub fn run(
                             ..destination + output.bytecode.end as u64,
                     );
                     entries.push(destination);
+                    report.vm_runtime += output.runtime_size;
+                    report.vm_raw_runtime += output.raw_runtime_size;
+                    report.vm_handlers += output.handlers;
+                    report.vm_substitutions += output.substitutions;
                     report.vm_instructions += output.instructions;
                     report.vm_bytecode += output.bytecode.len();
+                    bindings.push(vm::Pending {
+                        range: code.len()..code.len() + output.code.len(),
+                        binding: output.binding,
+                    });
                     code.extend(output.code);
                     report.vm += 1;
                     continue;
@@ -221,10 +253,15 @@ pub fn run(
         insns: &insns,
         functions: &functions,
         entries: &mut entries,
+        virtualized: &virtualized,
     })?;
     if !banner.is_empty() {
         let destination = layout.base + code.len() as u64;
-        let main = main_hook.map(|(_, dest)| dest);
+        let main = main_hook.map(|(entry, destination)| {
+            let at = (offset + entry - base) as usize;
+            let word = u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+            scene_disasm::arm64::target(word, entry).unwrap_or(destination)
+        });
         let emitted = scene_passes::arm64::banner::emit(destination, banner, main)?;
         ensure!(layout.fits(code.len() + emitted.code.len()), "banner exceeds executable space");
         protected.push(destination..destination + emitted.code.len() as u64);
@@ -239,6 +276,7 @@ pub fn run(
             None => log::info!("banner: {} lines embedded at {destination:#x}", banner.len()),
         }
     }
+    vm::seal(&mut code, bindings, &out, offset, base)?;
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible instructions to transform");
     layout.finish(&out, code, &entries, &protected)

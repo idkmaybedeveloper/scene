@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail, ensure};
-use scene_disasm::arm64::{Insn, target};
+use anyhow::{Context, Result, bail, ensure};
+use bad64::{FlagEffect, Instruction, Op, Operand, Reg, Shift};
+use scene_disasm::arm64::{Insn, branch_condition, label};
 
-use super::bytecode::{Kind, Program, RECORD_SIZE, Record};
+use super::{
+    bytecode::{Kind, Program, RECORD_SIZE, Record},
+    operands,
+};
 
 pub fn lift(insns: &[Insn]) -> Result<Program> {
     ensure!(!insns.is_empty(), "vm: empty function");
@@ -18,8 +22,9 @@ pub fn lift(insns: &[Insn]) -> Result<Program> {
         }
         let insn = &insns[index];
         ensure!(insn.address == start + index as u64 * 4, "vm: noncontiguous function");
-        ensure!(!insn.data && insn.decode().is_some(), "vm: data or invalid instruction");
-        let record = translate(insn)?;
+        ensure!(!insn.data, "vm: data in function");
+        let translated = translate(insn)?;
+        let record = &translated[0];
         if let Some(address) = record.target {
             let offset = address.wrapping_sub(start);
             ensure!(
@@ -31,16 +36,19 @@ pub fn lift(insns: &[Insn]) -> Result<Program> {
         if !matches!(record.opcode.kind, Kind::Jump | Kind::Return) {
             pending.push(index + 1);
         }
-        records.insert(insn.address, record);
+        records.insert(insn.address, translated);
     }
-    let offsets: BTreeMap<_, _> = records
-        .keys()
-        .enumerate()
-        .map(|(i, &address)| (address, (i * RECORD_SIZE) as u64))
-        .collect();
-    let sources =
-        records.keys().map(|address| insns[((address - start) / 4) as usize].clone()).collect();
-    let mut records: Vec<_> = records.into_values().collect();
+    let mut offsets = BTreeMap::new();
+    let mut sources = Vec::new();
+    let mut flattened = Vec::new();
+    for (address, translated) in records {
+        offsets.insert(address, (flattened.len() * RECORD_SIZE) as u64);
+        for record in translated {
+            flattened.push(record);
+            sources.push(insns[((address - start) / 4) as usize].clone());
+        }
+    }
+    let mut records = flattened;
     for record in &mut records {
         if let Some(address) = record.target {
             record.immediate = offsets[&address];
@@ -48,80 +56,171 @@ pub fn lift(insns: &[Insn]) -> Result<Program> {
     }
     let entry_patch = start + if insns[0].decode().unwrap().op() == bad64::Op::BTI { 4 } else { 0 };
     ensure!(insns.iter().any(|i| i.address == entry_patch), "vm: missing entry instruction");
+    ensure!(
+        !records
+            .iter()
+            .zip(&sources)
+            .any(|(record, source)| record.opcode.kind == Kind::Call
+                && source.address == entry_patch),
+        "vm: call overlaps entry trampoline"
+    );
     Ok(Program { records, sources, entry_patch })
 }
 
-fn translate(insn: &Insn) -> Result<Record> {
-    let word = insn.word;
-    if word == 0xd503_201f || insn.decode().unwrap().op() == bad64::Op::BTI {
-        return Ok(Record::new(Kind::Nop, word));
+fn translate(insn: &Insn) -> Result<Vec<Record>> {
+    let decoded = insn.decode().context("vm: invalid instruction")?;
+    if let Some(records) = super::memory::lift(&decoded)? {
+        return Ok(records);
     }
-    if word == 0xd65f_03c0 {
-        return Ok(Record::new(Kind::Return, word));
+    Ok(vec![translate_one(&decoded)?])
+}
+
+fn translate_one(decoded: &Instruction) -> Result<Record> {
+    let args = decoded.operands();
+    match decoded.op() {
+        Op::NOP | Op::BTI => Ok(Record::new(Kind::Nop, true)),
+        Op::BL | Op::BLR => {
+            let mut record = Record::new(Kind::Call, true);
+            record.immediate = decoded.address();
+            Ok(record)
+        }
+        Op::ADR | Op::ADRP => {
+            let mut record = Record::new(Kind::Address, true);
+            record.dst = operands::register(&args[0])?.index;
+            record.immediate = label(decoded).context("vm: address has no label")?;
+            Ok(record)
+        }
+        Op::RET => {
+            ensure!(
+                args.is_empty() || matches!(args, [Operand::Reg { reg: Reg::X30, arrspec: None }]),
+                "vm: unsupported return register"
+            );
+            Ok(Record::new(Kind::Return, true))
+        }
+        Op::B | Op::CBZ | Op::CBNZ | Op::TBZ | Op::TBNZ => branch(decoded),
+        op if branch_condition(op).is_some() => branch(decoded),
+        Op::MOV | Op::MOVZ | Op::MOVN | Op::MOVK => move_value(decoded),
+        Op::ADD
+        | Op::ADDS
+        | Op::SUB
+        | Op::SUBS
+        | Op::AND
+        | Op::ANDS
+        | Op::ORR
+        | Op::EOR
+        | Op::BIC
+        | Op::BICS
+        | Op::ORN
+        | Op::EON
+        | Op::CMP
+        | Op::CMN
+        | Op::TST
+        | Op::NEG
+        | Op::NEGS
+        | Op::MVN => arithmetic(decoded),
+        _ => bail!("vm: unsupported instruction {decoded}"),
     }
-    if word & 0xfc00_0000 == 0x1400_0000
-        || word & 0xff00_0010 == 0x5400_0000
-        || word & 0x7e00_0000 == 0x3400_0000
-        || word & 0x7e00_0000 == 0x3600_0000
-    {
-        let kind = match word & 0x7e00_0000 {
-            0x1400_0000 | 0x1600_0000 => Kind::Jump,
-            0x5400_0000 => Kind::Condition,
-            0x3400_0000 => Kind::Zero,
-            _ => Kind::Bit,
-        };
-        let mut record = Record::new(kind, word);
-        record.lhs = (word & 31) as u8;
-        record.aux = match kind {
-            Kind::Condition => word & 15,
-            Kind::Zero => word >> 24 & 1,
-            Kind::Bit => (word >> 19 & 31) | (word >> 26 & 32) | (word >> 24 & 1) << 8,
-            _ => 0,
-        };
-        record.target = target(word, insn.address);
-        return Ok(record);
-    }
-    if word & 0x1f00_0000 == 0x1100_0000 {
-        let mut record = Record::new(if word >> 30 & 1 == 0 { Kind::Add } else { Kind::Sub }, word);
-        record.opcode.flags = word >> 29 & 1 != 0;
-        ensure!(
-            record.lhs != 31 && (record.dst != 31 || record.opcode.flags),
-            "vm: stack pointer arithmetic unsupported"
-        );
-        record.rhs = 255;
-        record.immediate =
-            ((word >> 10 & 0xfff) as u64) << (if word >> 22 & 1 == 0 { 0 } else { 12 });
-        return Ok(record);
-    }
-    if word & 0x1f20_0000 == 0x0b00_0000 {
-        let mut record = Record::new(if word >> 30 & 1 == 0 { Kind::Add } else { Kind::Sub }, word);
-        record.opcode.flags = word >> 29 & 1 != 0;
-        record.aux = (word >> 22 & 3) | (word >> 10 & 63) << 2;
-        ensure!(record.aux & 3 != 3, "vm: reserved arithmetic shift");
-        return Ok(record);
-    }
-    if word & 0x1f00_0000 == 0x0a00_0000 {
-        let kind = match word >> 29 & 3 {
-            0 | 3 => Kind::And,
-            1 => Kind::Or,
-            _ => Kind::Xor,
-        };
-        let mut record = Record::new(kind, word);
-        record.opcode.flags = word >> 29 & 3 == 3;
-        record.aux = (word >> 22 & 3) | (word >> 10 & 63) << 2 | (word >> 21 & 1) << 8;
-        return Ok(record);
-    }
-    if word & 0x1f80_0000 == 0x1280_0000 {
-        let variant = word >> 29 & 3;
-        ensure!(variant != 1, "vm: reserved move-wide instruction");
-        let mut record = Record::new(if variant == 3 { Kind::Keep } else { Kind::Move }, word);
-        let shift = (word >> 21 & 3) * 16;
-        record.immediate = ((word >> 5 & 0xffff) as u64) << shift;
-        if variant == 0 {
+}
+
+fn branch(decoded: &Instruction) -> Result<Record> {
+    let op = decoded.op();
+    let args = decoded.operands();
+    let mut record = if let Some(condition) = branch_condition(op) {
+        let mut record = Record::new(Kind::Condition, true);
+        record.aux = condition as u32;
+        record
+    } else if op == Op::B {
+        Record::new(Kind::Jump, true)
+    } else {
+        let source = operands::register(&args[0])?;
+        let bit = matches!(op, Op::TBZ | Op::TBNZ);
+        let mut record = Record::new(if bit { Kind::Bit } else { Kind::Zero }, source.wide);
+        record.lhs = source.index;
+        if bit {
+            let index = operands::integer(&args[1])?;
+            ensure!(index < 64, "vm: invalid bit index");
+            record.aux = index as u32 | u32::from(op == Op::TBNZ) << 8;
+        } else {
+            record.aux = u32::from(op == Op::CBNZ);
+        }
+        record
+    };
+    record.target = Some(label(decoded).context("vm: branch has no label")?);
+    Ok(record)
+}
+
+fn move_value(decoded: &Instruction) -> Result<Record> {
+    let [dst, source] = decoded.operands() else {
+        bail!("vm: unsupported move {decoded}");
+    };
+    let dst = operands::register(dst)?;
+    let mut record =
+        Record::new(if decoded.op() == Op::MOVK { Kind::Keep } else { Kind::Move }, dst.wide);
+    record.dst = dst.index;
+    if matches!(source, Operand::Reg { .. } | Operand::ShiftReg { .. }) {
+        record.opcode.kind = Kind::Or;
+        rhs(&mut record, source)?;
+    } else {
+        record.immediate = operands::integer(source)?;
+        if decoded.op() == Op::MOVN {
             record.immediate = !record.immediate;
         }
-        record.aux = shift;
-        return Ok(record);
+        if record.opcode.kind == Kind::Keep {
+            record.aux = match source {
+                Operand::Imm32 { shift: Some(Shift::LSL(amount)), .. }
+                | Operand::Imm64 { shift: Some(Shift::LSL(amount)), .. } => *amount,
+                _ => 0,
+            };
+        }
     }
-    bail!("vm: unsupported instruction {}", insn.decode().unwrap())
+    Ok(record)
+}
+
+fn arithmetic(decoded: &Instruction) -> Result<Record> {
+    let op = decoded.op();
+    let args = decoded.operands();
+    let kind = match op {
+        Op::ADD | Op::ADDS | Op::CMN => Kind::Add,
+        Op::SUB | Op::SUBS | Op::CMP | Op::NEG | Op::NEGS => Kind::Sub,
+        Op::AND | Op::ANDS | Op::BIC | Op::BICS | Op::TST => Kind::And,
+        Op::ORR | Op::ORN | Op::MVN => Kind::Or,
+        _ => Kind::Xor,
+    };
+    let comparison = matches!(op, Op::CMP | Op::CMN | Op::TST);
+    let unary = matches!(op, Op::NEG | Op::NEGS | Op::MVN);
+    ensure!(
+        args.len() == if comparison || unary { 2 } else { 3 },
+        "vm: unsupported arithmetic operands {decoded}"
+    );
+    let first = operands::register(&args[0])?;
+    let mut record = Record::new(kind, first.wide);
+    record.opcode.flags = decoded.flags_set() == Some(FlagEffect::Integer);
+    record.dst = if comparison { 31 } else { first.index };
+    record.lhs = if comparison {
+        first.index
+    } else if unary {
+        31
+    } else {
+        operands::register(&args[1])?.index
+    };
+    rhs(&mut record, args.last().unwrap())?;
+    if matches!(op, Op::BIC | Op::BICS | Op::ORN | Op::EON | Op::MVN) {
+        record.aux |= 1 << 8;
+    }
+    Ok(record)
+}
+
+fn rhs(record: &mut Record, operand: &Operand) -> Result<()> {
+    match *operand {
+        Operand::Reg { .. } => record.rhs = operands::register(operand)?.index,
+        Operand::ShiftReg { reg, shift } => {
+            record.rhs = operands::general_register(reg)?.index;
+            record.aux = operands::shift(shift)?;
+        }
+        _ => {
+            record.rhs = 255;
+            record.immediate = operands::integer(operand)?;
+        }
+    }
+    Ok(())
 }

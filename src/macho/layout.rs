@@ -83,18 +83,19 @@ impl CodeLayout {
             .map(|(o, _)| o as usize)
             .min()
             .context("missing section data")?;
-        let saved = sections::header_savings(file);
+        let section_savings = sections::header_savings(file);
+        let (metadata_savings, signature_space) = metadata::header_savings(data)?;
+        let saved = section_savings + metadata_savings;
         let storage_size = (storage_size as u64 + page_size - 1) & !(page_size - 1);
         let extend_storage = file.segments().any(|s| {
             s.address() + s.size() == linkedit.address()
-                && (s.name().ok().flatten() != Some("__DATA_CONST") || file.architecture() == Architecture::X86_64)
-                && matches!(s.flags(), object::SegmentFlags::MachO { initprot, flags, .. } if initprot & macho::VM_PROT_WRITE != macho::VmProt(0) && (flags & macho::SG_READ_ONLY == macho::SegmentFlags(0) || file.architecture() == Architecture::X86_64))
+                && matches!(s.flags(), object::SegmentFlags::MachO { initprot, .. } if initprot & macho::VM_PROT_WRITE != macho::VmProt(0))
         });
         let extra = if storage_size != 0 && !extend_storage { 72 } else { 0 };
         let required_end = commands_end
-            .checked_add(152 + extra + 16 + header_space)
+            .checked_add(152 + extra + signature_space + header_space)
             .context("load command size overflow")?
-            - saved;
+            .saturating_sub(saved);
         if required_end <= first_section
             && data.get(commands_end..first_section).is_some_and(|b| b.iter().all(|&b| b == 0))
         {
@@ -103,13 +104,13 @@ impl CodeLayout {
                 data_base: linkedit.address(),
                 text_base: text.address(),
                 placement: Placement::Segment,
-                merge_sections: saved != 0,
+                merge_sections: section_savings != 0,
                 storage_size,
                 page_size,
             });
         }
         ensure!(
-            commands_end + extra + 16 + header_space <= first_section + saved,
+            commands_end + extra + signature_space + header_space <= first_section + saved,
             "no space for writable string storage"
         );
         let (text_offset, text_size) = text.file_range();
@@ -136,7 +137,7 @@ impl CodeLayout {
             data_base: linkedit.address(),
             text_base: text.address(),
             placement: Placement::Padding { offset: offset as usize, capacity: padding.len() },
-            merge_sections: saved != 0,
+            merge_sections: section_savings != 0,
             storage_size,
             page_size,
         })
@@ -357,12 +358,7 @@ fn add_storage(builder: &mut Builder<'_>, base: u64, size: u64) -> Result<()> {
         .segments
         .iter()
         .find(|s| {
-            s.vmaddr + s.vmsize == base
-                && (s.segname() != b"__DATA_CONST"
-                    || builder.header.cputype == macho::CPU_TYPE_X86_64)
-                && s.initprot & macho::VM_PROT_WRITE != macho::VmProt(0)
-                && (s.flags & macho::SG_READ_ONLY == macho::SegmentFlags(0)
-                    || builder.header.cputype == macho::CPU_TYPE_X86_64)
+            s.vmaddr + s.vmsize == base && s.initprot & macho::VM_PROT_WRITE != macho::VmProt(0)
         })
         .map(|s| s.id())
     {

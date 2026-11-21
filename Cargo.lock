@@ -2886,6 +2886,7 @@ dependencies = [
  "dynasmrt",
  "getrandom 0.2.17",
  "iced-x86",
+ "rand 0.8.8",
  "scene-asm",
  "scene-disasm",
 ]

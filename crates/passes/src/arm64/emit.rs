@@ -41,38 +41,44 @@ impl Emitter {
 
     #[allow(clippy::useless_conversion)]
     pub fn branch(&mut self, word: u32, label: Label) {
-        let reg = (word & 31) as u8;
-        match word & 0x7E00_0000 {
-            0x3600_0000 => {
-                let bit = (word >> 19 & 31) | (word >> 26 & 32);
-                if word & 0x0100_0000 == 0 {
-                    dynasm!(self.asm; .arch aarch64; tbz X(reg), bit, =>label);
+        use bad64::{Condition, Op, Operand};
+        use scene_disasm::arm64::{branch_condition, immediate, register_index};
+        let decoded = bad64::decode(word, 0).expect("valid branch instruction");
+        match decoded.op() {
+            Op::TBZ | Op::TBNZ => {
+                let [Operand::Reg { reg, .. }, Operand::Imm32 { imm, .. }, _] = decoded.operands()
+                else {
+                    unreachable!()
+                };
+                let register = register_index(*reg).unwrap();
+                let bit = immediate(*imm) as u32;
+                if decoded.op() == Op::TBZ {
+                    dynasm!(self.asm; .arch aarch64; tbz X(register), bit, =>label);
                 } else {
-                    dynasm!(self.asm; .arch aarch64; tbnz X(reg), bit, =>label);
+                    dynasm!(self.asm; .arch aarch64; tbnz X(register), bit, =>label);
                 }
             }
-            0x3400_0000 => match (word >> 31, word >> 24 & 1) {
-                (0, 0) => dynasm!(self.asm; .arch aarch64; cbz W(reg), =>label),
-                (0, 1) => dynasm!(self.asm; .arch aarch64; cbnz W(reg), =>label),
-                (1, 0) => dynasm!(self.asm; .arch aarch64; cbz X(reg), =>label),
-                (1, 1) => dynasm!(self.asm; .arch aarch64; cbnz X(reg), =>label),
-                _ => unreachable!(),
-            },
-            _ => {
+            Op::CBZ | Op::CBNZ => {
+                let Operand::Reg { reg, .. } = decoded.operands()[0] else { unreachable!() };
+                let register = register_index(reg).unwrap();
+                match (reg.size(), decoded.op()) {
+                    (4, Op::CBZ) => dynasm!(self.asm; .arch aarch64; cbz W(register), =>label),
+                    (4, Op::CBNZ) => dynasm!(self.asm; .arch aarch64; cbnz W(register), =>label),
+                    (8, Op::CBZ) => dynasm!(self.asm; .arch aarch64; cbz X(register), =>label),
+                    (8, Op::CBNZ) => dynasm!(self.asm; .arch aarch64; cbnz X(register), =>label),
+                    _ => unreachable!(),
+                }
+            }
+            op => {
                 macro_rules! conditions {
-                    ($($code:literal => $condition:ident),* $(,)?) => {
-                        match word & 15 {
-                            $($code => dynasm!(self.asm; .arch aarch64; b.$condition =>label),)*
-                            _ => unreachable!(),
+                    ($($code:ident => $condition:ident),* $(,)?) => {
+                        match branch_condition(op).expect("conditional branch") {
+                            $(Condition::$code => dynasm!(self.asm; .arch aarch64; b.$condition =>label),)*
                         }
                     };
                 }
-                conditions!(
-                    0 => eq, 1 => ne, 2 => hs, 3 => lo,
-                    4 => mi, 5 => pl, 6 => vs, 7 => vc,
-                    8 => hi, 9 => ls, 10 => ge, 11 => lt,
-                    12 => gt, 13 => le, 14 => al, 15 => nv,
-                );
+                conditions!(EQ=>eq,NE=>ne,CS=>hs,CC=>lo,MI=>mi,PL=>pl,VS=>vs,VC=>vc,
+                    HI=>hi,LS=>ls,GE=>ge,LT=>lt,GT=>gt,LE=>le,AL=>al,NV=>nv);
             }
         }
     }

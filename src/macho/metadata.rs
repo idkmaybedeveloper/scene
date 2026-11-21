@@ -14,6 +14,7 @@ pub fn apply(
     code_end: u64,
     protected: &[Range<u64>],
 ) -> Result<()> {
+    compact_header(builder);
     let debug: Vec<_> = builder
         .sections
         .iter()
@@ -106,6 +107,37 @@ pub fn apply(
         debug.len()
     );
     Ok(())
+}
+
+pub fn header_savings(data: &[u8]) -> Result<(usize, usize)> {
+    let builder = Builder::read(data)?;
+    let saved = builder
+        .commands
+        .iter()
+        .map(|command| match command {
+            LoadCommand::Other { cmd, data } if *cmd == macho::LC_SOURCE_VERSION => data.len() + 8,
+            LoadCommand::LinkeditData { cmd, data }
+                if *cmd == macho::LC_DATA_IN_CODE && data.is_empty() =>
+            {
+                16
+            }
+            LoadCommand::BuildVersion(version) => version.tools.len() * 8,
+            _ => 0,
+        })
+        .sum();
+    let signature = builder.commands.iter().any(|command| matches!(command, LoadCommand::LinkeditData { cmd, .. } if *cmd == macho::LC_CODE_SIGNATURE));
+    Ok((saved, if signature { 0 } else { 16 }))
+}
+
+fn compact_header(builder: &mut Builder<'_>) {
+    builder.commands.retain(|command| !matches!(command,
+        LoadCommand::Other { cmd, .. } if *cmd == macho::LC_SOURCE_VERSION)
+        && !matches!(command, LoadCommand::LinkeditData { cmd, data } if *cmd == macho::LC_DATA_IN_CODE && data.is_empty()));
+    for command in &mut builder.commands {
+        if let LoadCommand::BuildVersion(version) = command {
+            version.tools.clear();
+        }
+    }
 }
 
 pub fn is_debug_section(segment: &[u8], name: &[u8], flags: macho::SectionFlags) -> bool {

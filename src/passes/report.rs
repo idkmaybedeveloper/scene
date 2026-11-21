@@ -5,6 +5,10 @@ pub struct Report {
     pub vm: usize,
     pub vm_instructions: usize,
     pub vm_bytecode: usize,
+    pub vm_runtime: usize,
+    pub vm_raw_runtime: usize,
+    pub vm_handlers: usize,
+    pub vm_substitutions: usize,
     pub cff: usize,
     pub mba_only: usize,
     pub substitutions: usize,
@@ -31,6 +35,13 @@ impl Report {
 
     pub fn print(&self, size: usize) {
         if self.vm != 0 {
+            log::info!(
+                "vm runtime: {} handlers, {} mba substitutions, {} -> {} bytes",
+                self.vm_handlers,
+                self.vm_substitutions,
+                self.vm_raw_runtime,
+                self.vm_runtime
+            );
             log::info!(
                 "generated {} vm instructions, {} bytecode bytes",
                 self.vm_instructions,

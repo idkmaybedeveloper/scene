@@ -1,6 +1,7 @@
 use std::{fmt, ops::Range};
 
 use anyhow::{Result, ensure};
+use bad64::{Condition, Imm, Instruction, Op, Operand, Reg};
 #[derive(Clone, Debug)]
 pub struct Insn {
     pub address: u64,
@@ -15,7 +16,6 @@ impl Insn {
     }
 }
 
-// ref: Arm ARM, C4.1 "A64 instruction set encoding", sections
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PcRel {
     Imm26,
@@ -27,31 +27,73 @@ pub enum PcRel {
 
 //TODO: FEAT_CMPBR compare-and-branch (CB<cc>) has its own imm9 form
 pub fn pc_rel(word: u32) -> Option<PcRel> {
-    match word {
-        w if w & 0x7C00_0000 == 0x1400_0000 => Some(PcRel::Imm26),
-        w if w & 0xFF00_0000 == 0x5400_0000 => Some(PcRel::Imm19),
-        w if w & 0x7E00_0000 == 0x3400_0000 => Some(PcRel::Imm19),
-        w if w & 0x3B00_0000 == 0x1800_0000 => Some(PcRel::Imm19),
-        w if w & 0x7E00_0000 == 0x3600_0000 => Some(PcRel::Imm14),
-        w if w & 0x9F00_0000 == 0x1000_0000 => Some(PcRel::Adr),
-        w if w & 0x9F00_0000 == 0x9000_0000 => Some(PcRel::Adrp),
+    let decoded = bad64::decode(word, 0).ok()?;
+    match decoded.op() {
+        Op::B | Op::BL => Some(PcRel::Imm26),
+        Op::CBZ | Op::CBNZ => Some(PcRel::Imm19),
+        Op::TBZ | Op::TBNZ => Some(PcRel::Imm14),
+        Op::ADR => Some(PcRel::Adr),
+        Op::ADRP => Some(PcRel::Adrp),
+        Op::LDR | Op::LDRSW | Op::PRFM if label(&decoded).is_some() => Some(PcRel::Imm19),
+        op if branch_condition(op).is_some() => Some(PcRel::Imm19),
         _ => None,
     }
 }
 
 pub fn target(word: u32, pc: u64) -> Option<u64> {
-    let adr_imm = || (((word >> 5) & 0x7_FFFF) << 2 | (word >> 29) & 3) as u64;
-    Some(match pc_rel(word)? {
-        PcRel::Imm26 => pc.wrapping_add_signed(sext(word as u64 & 0x3FF_FFFF, 26) << 2),
-        PcRel::Imm19 => pc.wrapping_add_signed(sext((word >> 5) as u64 & 0x7_FFFF, 19) << 2),
-        PcRel::Imm14 => pc.wrapping_add_signed(sext((word >> 5) as u64 & 0x3FFF, 14) << 2),
-        PcRel::Adr => pc.wrapping_add_signed(sext(adr_imm(), 21)),
-        PcRel::Adrp => (pc & !0xFFF).wrapping_add_signed(sext(adr_imm(), 21) << 12),
+    label(&bad64::decode(word, pc).ok()?)
+}
+
+pub fn label(instruction: &Instruction) -> Option<u64> {
+    instruction.operands().iter().find_map(|operand| match operand {
+        Operand::Label(value) => Some(immediate(*value)),
+        _ => None,
     })
 }
 
-fn sext(value: u64, bits: u32) -> i64 {
-    ((value << (64 - bits)) as i64) >> (64 - bits)
+pub fn immediate(value: Imm) -> u64 {
+    match value {
+        Imm::Signed(value) => value as u64,
+        Imm::Unsigned(value) => value,
+    }
+}
+
+pub fn register_index(register: Reg) -> Option<u8> {
+    match register {
+        Reg::SP | Reg::WSP => Some(32),
+        Reg::XZR | Reg::WZR => Some(31),
+        Reg::X29 => Some(29),
+        Reg::X30 => Some(30),
+        register => {
+            register.name().strip_prefix(['x', 'w'])?.parse::<u8>().ok().filter(|&index| index < 31)
+        }
+    }
+}
+
+pub fn branch_condition(op: Op) -> Option<Condition> {
+    Some(match op {
+        Op::B_EQ => Condition::EQ,
+        Op::B_NE => Condition::NE,
+        Op::B_CS => Condition::CS,
+        Op::B_CC => Condition::CC,
+        Op::B_MI => Condition::MI,
+        Op::B_PL => Condition::PL,
+        Op::B_VS => Condition::VS,
+        Op::B_VC => Condition::VC,
+        Op::B_HI => Condition::HI,
+        Op::B_LS => Condition::LS,
+        Op::B_GE => Condition::GE,
+        Op::B_LT => Condition::LT,
+        Op::B_GT => Condition::GT,
+        Op::B_LE => Condition::LE,
+        Op::B_AL => Condition::AL,
+        Op::B_NV => Condition::NV,
+        _ => return None,
+    })
+}
+
+pub fn is_conditional_branch(op: Op) -> bool {
+    matches!(op, Op::CBZ | Op::CBNZ | Op::TBZ | Op::TBNZ) || branch_condition(op).is_some()
 }
 
 pub fn decode(code: &[u8], base: u64, is_data: impl Fn(Range<u64>) -> bool) -> Result<Vec<Insn>> {
