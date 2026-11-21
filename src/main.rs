@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod macho;
 mod passes;
 mod rewrite;
@@ -11,17 +12,37 @@ use object::BinaryFormat;
 
 fn main() -> Result<()> {
     let args = cli::Args::parse();
-    let data =
-        fs::read(&args.input).with_context(|| format!("reading {}", args.input.display()))?;
+    if args.init {
+        return config::init();
+    }
+
+    let mut config = match &args.config {
+        Some(path) => config::Config::load(path)?,
+        None => config::Config::load_default()?,
+    };
+    if let Some(input) = args.input {
+        config.input = Some(input);
+    }
+    if let Some(output) = args.output {
+        config.output = Some(output);
+    }
+    let dump = args.dump || config.dump;
+    let input =
+        config.input.context("no input: set `input` in scene.toml or pass it on the command line")?;
+    let output = config
+        .output
+        .context("no output: set `output` in scene.toml or pass it on the command line")?;
+
+    let data = fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
     let file =
         object::File::parse(&*data).context("parsing binary (fat mach-o? thin it with lipo)")?;
 
-    let mut out = rewrite::rewrite(&file, &data, args.dump)?;
+    let mut out = rewrite::rewrite(&file, &data, dump, &config.passes)?;
     if file.format() == BinaryFormat::MachO {
         out = macho::adhoc_sign(&out)?;
     }
 
-    fs::write(&args.output, &out).with_context(|| format!("writing {}", args.output.display()))?;
-    fs::set_permissions(&args.output, fs::metadata(&args.input)?.permissions())?;
+    fs::write(&output, &out).with_context(|| format!("writing {}", output.display()))?;
+    fs::set_permissions(&output, fs::metadata(&input)?.permissions())?;
     Ok(())
 }

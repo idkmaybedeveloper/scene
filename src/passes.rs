@@ -5,6 +5,7 @@ use object::{Object, ObjectSection};
 use scene_disasm::{Listing, arm64::Insn};
 use scene_passes::arm64::{Options, mba_sites, substitute, transform};
 
+use crate::config::Passes;
 use crate::macho::{
     self, functions,
     layout::CodeLayout,
@@ -15,14 +16,14 @@ mod report;
 pub mod x86;
 use report::Report;
 
-pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
+pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Result<Vec<u8>> {
     let section = file.section_by_name("__text").context("missing __text section")?;
     let (offset, size) = section.file_range().context("__text has no file data")?;
     let base = section.address();
     let functions = functions::in_text(file, base, size)?;
     let dice = macho::data_in_code(file)?;
     let insns = decode(section.data()?, base, offset, &dice)?;
-    let strings = Strings::collect(file, &insns, &functions)?;
+    let strings = Strings::collect(file, &insns, &functions, passes.strings)?;
     let layout = CodeLayout::new(file, data, strings.storage_size())?;
     let mut moved = std::collections::BTreeMap::new();
     if dump {
@@ -34,12 +35,19 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
     let mut report = Report::default();
     for function in &functions {
         let candidate = &insns[function.range.clone()];
+        if !passes.cff && !passes.mba {
+            report.skip("all code passes disabled");
+            continue;
+        }
         let destination = layout.base + code.len() as u64;
         let converted = (|| -> Result<_> {
             let len = candidate.len();
             let start = candidate[0].address;
-            let options =
-                Options { seed: Options::default().seed ^ start as u32, ..Options::default() };
+            let options = Options {
+                mba: passes.mba,
+                cff: passes.cff,
+                seed: passes.seed ^ start as u32,
+            };
             let output = transform(candidate, destination, options)?;
             ensure!(
                 layout.fits(code.len() + output.insns.len() * 4),
@@ -65,6 +73,12 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
             Ok(converted) => converted,
             Err(error) => {
                 report.cff_skip(&error);
+                if !passes.mba {
+                    if dump {
+                        eprintln!("{}: skipped: {error:#}", function.name);
+                    }
+                    continue;
+                }
                 match substitute_function(candidate, &layout, code.len()) {
                     Ok(patches) if !patches.entries.is_empty() => {
                         let count = patches.entries.len();

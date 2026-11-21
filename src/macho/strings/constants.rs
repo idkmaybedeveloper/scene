@@ -13,6 +13,10 @@ pub(super) struct Constants {
 }
 
 impl Constants {
+    pub fn empty() -> Self {
+        Self { values: Vec::new(), pages: Vec::new(), kept: 0 }
+    }
+
     pub fn collect(file: &object::File) -> Result<Self> {
         let mut result = Self { values: Vec::new(), pages: Vec::new(), kept: 0 };
         let page_size = 0x4000;

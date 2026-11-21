@@ -41,19 +41,28 @@ pub struct Rewrite<'a, 'data> {
 }
 
 impl Strings {
-    pub fn collect(file: &object::File, insns: &[Insn], functions: &[Function]) -> Result<Self> {
+    pub fn collect(
+        file: &object::File,
+        insns: &[Insn],
+        functions: &[Function],
+        encrypt: bool,
+    ) -> Result<Self> {
+        let empty = |constants| Self {
+            section: 0..0,
+            values: Vec::new(),
+            references: Vec::new(),
+            pointers: Vec::new(),
+            kept: 0,
+            constants,
+        };
+        if !encrypt {
+            return Ok(empty(constants::Constants::empty()));
+        }
         let constants = constants::Constants::collect(file)?;
         let Some(section) = file.sections().find(|s| {
             s.name().ok() == Some("__cstring") && s.segment_name().ok().flatten() == Some("__TEXT")
         }) else {
-            return Ok(Self {
-                section: 0..0,
-                values: Vec::new(),
-                references: Vec::new(),
-                pointers: Vec::new(),
-                kept: 0,
-                constants,
-            });
+            return Ok(empty(constants));
         };
         let range = section.address()..section.address() + section.size();
         let (offset, _) = section.file_range().context("strings have no file data")?;

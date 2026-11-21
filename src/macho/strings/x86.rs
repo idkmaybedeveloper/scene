@@ -47,9 +47,13 @@ impl Strings {
         insns: &[Insn],
         targets: &BTreeSet<u64>,
         rows: &BTreeMap<u64, Row>,
+        encrypt: bool,
     ) -> Result<Self> {
         let mut result =
             Self { start: 0, size: 0, values: Vec::new(), references: Vec::new(), kept: 0 };
+        if !encrypt {
+            return Ok(result);
+        }
         let Some(section) = file.section_by_name("__cstring") else { return Ok(result) };
         result.start = section.address();
         result.size = section.size() as usize;

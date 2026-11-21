@@ -2789,6 +2789,8 @@ dependencies = [
  "scene-asm",
  "scene-disasm",
  "scene-passes",
+ "serde",
+ "toml",
 ]
 
 [[package]]

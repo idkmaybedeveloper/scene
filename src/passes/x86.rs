@@ -11,6 +11,7 @@ use scene_passes::x86::unwind as frames;
 use scene_passes::x86::{Options, Output};
 
 use super::report::Report;
+use crate::config::Passes;
 use crate::macho::{
     self, functions,
     layout::CodeLayout,
@@ -18,7 +19,7 @@ use crate::macho::{
     unwind::Unwind,
 };
 
-pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
+pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Result<Vec<u8>> {
     ensure!(
         !file.segments().any(|s| s.name().ok().flatten() == Some("__SCENE")),
         "binary already contains scene"
@@ -93,7 +94,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
             tables.extend(known);
         }
     }
-    let strings = Strings::collect(file, &insns, &targets, &source_rows)?;
+    let strings = Strings::collect(file, &insns, &targets, &source_rows, passes.strings)?;
     let mut unwind = Unwind::new(file)?;
     unwind.reserve(strings.unwind_budget(), strings.code_budget())?;
     let layout = CodeLayout::with_metadata(
@@ -123,49 +124,64 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
             report.skip("data or invalid function boundary");
             continue;
         };
-        let destination = layout.base + code.len() as u64;
-        let converted = (|| -> Result<_> {
-            let options = Options {
-                seed: Options::default().seed ^ range.start as u32,
-                ..Options::default()
-            };
-            let output =
-                scene_passes::x86::transform_with_tables(&decoded, destination, options, &tables)?;
-            ensure!(layout.fits(code.len() + output.code.len()), "executable padding exhausted");
-            let bridges = bridges(&decoded, &output, destination, &targets)?;
-            unwind.add(destination, output.code.len(), &output.unwind)?;
-            Ok((output, bridges))
-        })();
-        match converted {
-            Ok((output, bridges)) => {
-                for bridge in bridges {
-                    let at = (offset + bridge.address - base) as usize;
-                    out[at..at + bridge.size].fill(0x90);
-                    out[at..at + bridge.bytes.len()].copy_from_slice(&bridge.bytes);
+        if !passes.cff && !passes.mba {
+            report.skip("all code passes disabled");
+            continue;
+        }
+        if passes.cff {
+            let destination = layout.base + code.len() as u64;
+            let converted = (|| -> Result<_> {
+                let options =
+                    Options { mba: passes.mba, seed: passes.seed ^ range.start as u32 };
+                let output = scene_passes::x86::transform_with_tables(
+                    &decoded,
+                    destination,
+                    options,
+                    &tables,
+                )?;
+                ensure!(
+                    layout.fits(code.len() + output.code.len()),
+                    "executable padding exhausted"
+                );
+                let bridges = bridges(&decoded, &output, destination, &targets)?;
+                unwind.add(destination, output.code.len(), &output.unwind)?;
+                Ok((output, bridges))
+            })();
+            match converted {
+                Ok((output, bridges)) => {
+                    for bridge in bridges {
+                        let at = (offset + bridge.address - base) as usize;
+                        out[at..at + bridge.size].fill(0x90);
+                        out[at..at + bridge.bytes.len()].copy_from_slice(&bridge.bytes);
+                    }
+                    if dump {
+                        eprintln!(
+                            "{:#x} -> {destination:#x}: {} blocks, {} mba, {} bytes",
+                            range.start,
+                            output.blocks,
+                            output.substitutions,
+                            output.code.len()
+                        );
+                    }
+                    report.cff += 1;
+                    report.substitutions += output.substitutions;
+                    entries.push(destination);
+                    entries.extend(output.resumes.values().copied());
+                    moved.extend(output.moved);
+                    code.extend(output.code);
+                    continue;
                 }
-                if dump {
-                    eprintln!(
-                        "{:#x} -> {destination:#x}: {} blocks, {} mba, {} bytes",
-                        range.start,
-                        output.blocks,
-                        output.substitutions,
-                        output.code.len()
-                    );
+                Err(error) => {
+                    report.cff_skip(&error);
+                    if dump {
+                        eprintln!("{:#x}: cff skipped: {error:#}", range.start);
+                    }
                 }
-                report.cff += 1;
-                report.substitutions += output.substitutions;
-                entries.push(destination);
-                entries.extend(output.resumes.values().copied());
-                moved.extend(output.moved);
-                code.extend(output.code);
-                continue;
             }
-            Err(error) => {
-                report.cff_skip(&error);
-                if dump {
-                    eprintln!("{:#x}: cff skipped: {error:#}", range.start);
-                }
-            }
+        }
+        if !passes.mba {
+            report.skip("no eligible arithmetic");
+            continue;
         }
         let previous = report.substitutions;
         for (index, insn) in decoded.iter().enumerate() {

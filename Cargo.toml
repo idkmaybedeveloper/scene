@@ -34,6 +34,8 @@ scene-asm.workspace = true
 scene-passes.workspace = true
 apple-codesign.workspace = true
 leb128 = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 getrandom = "0.2.17"
 gimli = "0.34"
 macho-unwind-info = "0.5"

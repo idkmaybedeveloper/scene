@@ -4,13 +4,13 @@ use anyhow::{Context, Result, bail, ensure};
 use object::{Architecture, BinaryFormat, Object, ObjectSection, SectionKind};
 use scene_disasm::Arch;
 
-use crate::{macho, passes};
+use crate::{config::Passes, macho, passes};
 
-pub fn rewrite(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
+pub fn rewrite(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Result<Vec<u8>> {
     if file.format() == BinaryFormat::MachO {
         match file.architecture() {
-            Architecture::Aarch64 => return passes::run(file, data, dump),
-            Architecture::X86_64 => return passes::x86::run(file, data, dump),
+            Architecture::Aarch64 => return passes::run(file, data, dump, passes),
+            Architecture::X86_64 => return passes::x86::run(file, data, dump, passes),
             _ => {}
         }
     }

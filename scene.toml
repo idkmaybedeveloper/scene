@@ -1,0 +1,10 @@
+# hardcoded for macos/unix, windows untested
+input = "target/release/scene"
+output = "target/release/scene.protected"
+dump = false
+
+[passes]
+cff = true
+mba = true
+strings = true
+seed = 0x7363656e
