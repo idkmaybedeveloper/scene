@@ -124,15 +124,18 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
             report.skip("data or invalid function boundary");
             continue;
         };
-        if !passes.cff && !passes.mba {
+        if !passes.cff.on() && !passes.mba.on() {
             report.skip("all code passes disabled");
             continue;
         }
-        if passes.cff {
+        if passes.cff.on() {
             let destination = layout.base + code.len() as u64;
             let converted = (|| -> Result<_> {
-                let options =
-                    Options { mba: passes.mba, seed: passes.seed ^ range.start as u32 };
+                let options = Options {
+                    mba: passes.mba.get(),
+                    cff: passes.cff.get(),
+                    seed: passes.seed ^ range.start as u32,
+                };
                 let output = scene_passes::x86::transform_with_tables(
                     &decoded,
                     destination,
@@ -179,7 +182,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
                 }
             }
         }
-        if !passes.mba {
+        if !passes.mba.on() {
             report.skip("no eligible arithmetic");
             continue;
         }
@@ -190,7 +193,8 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
             }
             let destination = layout.base + code.len() as u64;
             let converted = (|| -> Result<_> {
-                let Some(bytes) = scene_passes::x86::substitute(&decoded[index..], destination)?
+                let Some(bytes) =
+                    scene_passes::x86::substitute(&decoded[index..], destination, passes.mba.get())?
                 else {
                     return Ok(None);
                 };

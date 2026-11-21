@@ -195,7 +195,7 @@ pub fn reachable_len(insns: &[Insn]) -> Result<usize> {
 }
 
 impl<'a> Function<'a> {
-    pub fn parse(insns: &'a [Insn]) -> Result<Self> {
+    pub fn parse(insns: &'a [Insn], cff: u32) -> Result<Self> {
         ensure!(!insns.is_empty(), "empty function");
         let start = insns[0].address;
         ensure!(start.is_multiple_of(4), "unaligned function");
@@ -247,6 +247,7 @@ impl<'a> Function<'a> {
                 }
             }
         }
+        split_blocks(&mut leaders, insns.len(), cff);
         let leaders: Vec<_> = leaders.into_iter().collect();
         let block_at = |address| leaders.binary_search(&((address - start) as usize / 4)).unwrap();
         let destination = |address| {
@@ -291,5 +292,27 @@ impl<'a> Function<'a> {
             blocks.push(Block { address: insns[first].address, body, exit, exit_address });
         }
         Ok(Self { insns, blocks, entry_patch })
+    }
+}
+
+/// subdivides straight-line runs into smaller basic blocks so the flattener produces more
+/// dispatcher states. inserted leaders only ever land on interior instructions of a natural
+/// block, whose predecessor is a fall-through, so each new block gets an unconditional
+/// `Exit::Jump` to the next. higher `cff` means a smaller step and thus more states.
+fn split_blocks(leaders: &mut BTreeSet<usize>, len: usize, cff: u32) {
+    let step = match cff {
+        0 | 1 => return,
+        2 => 4,
+        3 => 2,
+        _ => 1,
+    };
+    let mut bounds: Vec<usize> = leaders.iter().copied().collect();
+    bounds.push(len);
+    for pair in bounds.windows(2) {
+        let mut cut = pair[0] + step;
+        while cut < pair[1] {
+            leaders.insert(cut);
+            cut += step;
+        }
     }
 }

@@ -15,14 +15,16 @@ use emit::Emitter;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
-    pub mba: bool,
-    pub cff: bool,
+    /// mba nesting depth: 0 disables substitution, higher nests the identities deeper
+    pub mba: u32,
+    /// cff intensity: 0 disables flattening, higher splits blocks finer and adds decoys
+    pub cff: u32,
     pub seed: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { mba: true, cff: true, seed: 0x7363_656e }
+        Self { mba: 1, cff: 1, seed: 0x7363_656e }
     }
 }
 
@@ -47,9 +49,9 @@ pub fn mba_sites(insns: &[Insn]) -> Result<Vec<usize>> {
     cfg::mba_sites(insns)
 }
 
-pub fn substitute(insn: &Insn, base: u64) -> Result<Option<Vec<Insn>>> {
+pub fn substitute(insn: &Insn, base: u64, depth: u32) -> Result<Option<Vec<Insn>>> {
     let mut emitter = Emitter::new(base)?;
-    if !mba::emit(insn.word, &mut emitter) {
+    if depth == 0 || !mba::emit(insn.word, &mut emitter, depth) {
         return Ok(None);
     }
     emitter.jump_to(insn.address + 4);
@@ -58,10 +60,10 @@ pub fn substitute(insn: &Insn, base: u64) -> Result<Option<Vec<Insn>>> {
 
 pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> {
     let len = cfg::reachable_len(insns)?;
-    let function = Function::parse(&insns[..len])?;
+    let function = Function::parse(&insns[..len], options.cff)?;
     let mut emitter = Emitter::new(base)?;
     let labels: Vec<_> = function.blocks.iter().map(|_| emitter.label()).collect();
-    if options.cff {
+    if options.cff > 0 {
         cff::emit(&function, &labels, &mut emitter, options)?;
     } else {
         for (index, block) in function.blocks.iter().enumerate() {
@@ -92,7 +94,7 @@ pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> 
         insns: emitter.finish()?,
         blocks: function.blocks.len(),
         substitutions,
-        flattened: options.cff,
+        flattened: options.cff > 0,
         block_addresses,
         resumes,
         entry_patch: function.entry_patch,
@@ -101,10 +103,10 @@ pub fn transform(insns: &[Insn], base: u64, options: Options) -> Result<Output> 
     })
 }
 
-fn emit_body(emitter: &mut Emitter, insns: &[Insn], substitute: bool) -> Result<()> {
+fn emit_body(emitter: &mut Emitter, insns: &[Insn], depth: u32) -> Result<()> {
     for insn in insns {
         emitter.record(insn.address);
-        if substitute && mba::emit(insn.word, emitter) {
+        if depth > 0 && mba::emit(insn.word, emitter, depth) {
             emitter.substitutions += 1;
         } else {
             emitter.original(insn)?;

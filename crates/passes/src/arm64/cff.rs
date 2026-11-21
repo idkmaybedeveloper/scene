@@ -34,10 +34,12 @@ pub fn emit(
     let key: [u8; 16] =
         std::array::from_fn(|i| (options.seed.rotate_left((i * 7) as u32) >> (i % 4 * 8)) as u8);
     let cipher = Aes128::new(&key.into());
-    let states: Vec<_> = labels
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
+    let decoys = match options.cff {
+        0 | 1 => 0,
+        level => (labels.len() * (level as usize - 1) / 2).min(512),
+    };
+    let states: Vec<_> = (0..labels.len() + decoys)
+        .map(|index| {
             let mut input = Block::from((index as u128).to_le_bytes());
             cipher.encrypt_block(&mut input);
             let mut tag = input;
@@ -97,6 +99,16 @@ pub fn emit(
             ; ldp x16, x17, [sp], 176
         );
         out.jump(label);
+    }
+    // decoy gates mirror the real ones so they cant be told apart by shape
+    for (offset, state) in states[labels.len()..].iter().enumerate() {
+        out.bind(state.gate);
+        dynasm!(out.asm
+            ; .arch aarch64
+            ; ldp q30, q31, [sp, 16]
+            ; ldp x16, x17, [sp], 176
+        );
+        out.jump(labels[offset % labels.len()]);
     }
     Ok(())
 }

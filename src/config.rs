@@ -1,23 +1,60 @@
-use std::{fs, path::Path, path::PathBuf};
+use std::{fmt, fs, path::Path, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 const DEFAULT_PATH: &str = "scene.toml";
 const DEFAULT_SEED: u32 = 0x7363_656e; // "scen"
 
+/// intensity of a pass: 0 = off, 1 = default, higher = stronger. accepts either an
+/// integer or a boolean (true -> 1, false -> 0) in the config for convenience
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Level(pub u32);
+
+impl Level {
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    pub fn on(self) -> bool {
+        self.0 > 0
+    }
+}
+
+impl<'de> Deserialize<'de> for Level {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl de::Visitor<'_> for Visitor {
+            type Value = Level;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a boolean or a non-negative integer level")
+            }
+            fn visit_bool<E>(self, value: bool) -> Result<Level, E> {
+                Ok(Level(value as u32))
+            }
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Level, E> {
+                u32::try_from(value).map(Level).map_err(|_| E::custom("level is too large"))
+            }
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Level, E> {
+                u32::try_from(value).map(Level).map_err(|_| E::custom("level must fit in u32"))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Passes {
-    pub cff: bool,
-    pub mba: bool,
+    pub cff: Level,
+    pub mba: Level,
     pub strings: bool,
     pub seed: u32,
 }
 
 impl Default for Passes {
     fn default() -> Self {
-        Self { cff: true, mba: true, strings: true, seed: DEFAULT_SEED }
+        Self { cff: Level(1), mba: Level(1), strings: true, seed: DEFAULT_SEED }
     }
 }
 
@@ -53,8 +90,8 @@ output = \"path/to/binary.obf\"
 dump = false
 
 [passes]
-cff = true      # control-flow flattening
-mba = true      # mixed boolean-arithmetic substitution
+cff = 1         # control-flow flattening: 0 = off, 1 = default, higher = more states
+mba = 1         # mixed boolean-arithmetic: 0 = off, 1 = default, higher = deeper nesting
 strings = true  # string + constant encryption
 seed = 0x7363656e
 ";

@@ -34,7 +34,11 @@ pub enum Destination {
 }
 
 impl<'a> Function<'a> {
-    pub fn parse(insns: &'a [Instruction], tables: &BTreeMap<u64, Vec<u64>>) -> Result<Self> {
+    pub fn parse(
+        insns: &'a [Instruction],
+        tables: &BTreeMap<u64, Vec<u64>>,
+        cff: u32,
+    ) -> Result<Self> {
         ensure!(!insns.is_empty(), "empty function");
         let start = insns[0].ip();
         let end = insns.last().unwrap().next_ip();
@@ -126,6 +130,7 @@ impl<'a> Function<'a> {
         if leaders.len() == 1 && reachable.len() > 3 {
             leaders.insert(*reachable.iter().nth(reachable.len() / 2).unwrap());
         }
+        split_blocks(insns, &reachable, &mut leaders, cff);
         let leaders: Vec<_> = leaders.into_iter().filter(|i| reachable.contains(i)).collect();
         ensure!(leaders.len() <= 128, "too many blocks for x86 dispatcher");
         let block_at = |address| -> usize { leaders.binary_search(&indices[&address]).unwrap() };
@@ -195,5 +200,43 @@ impl<'a> Function<'a> {
         let entry_patch =
             if insns[0].mnemonic() == Mnemonic::Endbr64 { insns[0].next_ip() } else { start };
         Ok(Self { insns, blocks, entry_patch, tables: tables.clone() })
+    }
+}
+
+/// subdivides straight-line reachable runs into smaller blocks so the flattener emits more
+/// dispatcher states. a cut only lands between two contiguous reachable instructions whose
+/// predecessor falls through, which the `FlowControl::Next` exit arm turns into an
+/// unconditional jump to the next block. capped at the dispatcher's 128-block limit.
+fn split_blocks(
+    insns: &[Instruction],
+    reachable: &BTreeSet<usize>,
+    leaders: &mut BTreeSet<usize>,
+    cff: u32,
+) {
+    let step = match cff {
+        0 | 1 => return,
+        2 => 4,
+        3 => 2,
+        _ => 1,
+    };
+    let ordered: Vec<usize> = reachable.iter().copied().collect();
+    let mut since = 0;
+    for pair in ordered.windows(2) {
+        let (prev, next) = (pair[0], pair[1]);
+        since += 1;
+        if leaders.contains(&next) {
+            since = 0;
+            continue;
+        }
+        if next == prev + 1
+            && insns[prev].flow_control() == FlowControl::Next
+            && since >= step
+        {
+            if leaders.len() >= 128 {
+                break;
+            }
+            leaders.insert(next);
+            since = 0;
+        }
     }
 }

@@ -13,13 +13,16 @@ use iced_x86::{FlowControl, Instruction, Mnemonic};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
-    pub mba: bool,
+    /// mba nesting depth: 0 disables substitution, higher re-substitutes generated ops
+    pub mba: u32,
+    /// cff intensity: 0 disables flattening, higher splits blocks finer and adds decoys
+    pub cff: u32,
     pub seed: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { mba: true, seed: 0x7363_656e }
+        Self { mba: 1, cff: 1, seed: 0x7363_656e }
     }
 }
 
@@ -43,16 +46,16 @@ pub fn transform_with_tables(
     options: Options,
     tables: &BTreeMap<u64, Vec<u64>>,
 ) -> Result<Output> {
-    cff::transform(&cfg::Function::parse(insns, tables)?, base, options)
+    cff::transform(&cfg::Function::parse(insns, tables, options.cff)?, base, options)
 }
 
-pub fn substitute(insns: &[Instruction], base: u64) -> Result<Option<Vec<u8>>> {
+pub fn substitute(insns: &[Instruction], base: u64, depth: u32) -> Result<Option<Vec<u8>>> {
     let Some(insn) = insns.first() else { return Ok(None) };
-    if insn.len() < 5 {
+    if depth == 0 || insn.len() < 5 {
         return Ok(None);
     }
     let flags_dead = matches!(insn.mnemonic(), Mnemonic::Add | Mnemonic::Sub) && flags_dead(insns);
-    let Some(replacement) = mba::substitute(insn, flags_dead)? else {
+    let Some(replacement) = mba::substitute(insn, flags_dead, depth)? else {
         return Ok(None);
     };
     let mut bytes = scene_asm::x86::relocate(64, &replacement, base)?;

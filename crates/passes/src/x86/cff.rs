@@ -29,7 +29,7 @@ pub fn transform(function: &Function<'_>, base: u64, options: Options) -> Result
     let key =
         std::array::from_fn(|i| (options.seed.rotate_left((i * 7) as u32) >> (i % 4 * 8)) as u8);
     let cipher = Aes128::new(&key.into());
-    let states: Vec<_> = labels
+    let mut states: Vec<_> = labels
         .iter()
         .enumerate()
         .map(|(index, _)| {
@@ -42,6 +42,21 @@ pub fn transform(function: &Function<'_>, base: u64, options: Options) -> Result
         states.iter().map(|s| s.tag).collect::<BTreeSet<_>>().len() == states.len(),
         "dispatcher state collision"
     );
+    let decoys = match options.cff {
+        0 | 1 => 0,
+        level => (labels.len() * (level as usize - 1) / 2).min(256),
+    };
+    let mut seen: BTreeSet<[u8; 16]> = states.iter().map(|s| s.tag).collect();
+    let mut index = labels.len();
+    while states.len() < labels.len() + decoys && index < labels.len() + decoys * 4 {
+        let mut input = AesBlock::from((index as u128).to_le_bytes());
+        cipher.encrypt_block(&mut input);
+        let tag = tag(input.into(), key);
+        index += 1;
+        if seen.insert(tag) {
+            states.push(State { input: input.into(), tag, gate: out.label() });
+        }
+    }
     let mut resumes = BTreeMap::new();
     let mut substitutions = 0;
     transition(
@@ -62,8 +77,8 @@ pub fn transform(function: &Function<'_>, base: u64, options: Options) -> Result
             let insn = &function.insns[i];
             out.unwind(frames.rows[&insn.ip()].clone());
             out.record(insn.ip());
-            let replacement = if options.mba {
-                mba::substitute(insn, flags_dead(&function.insns[i..]))?
+            let replacement = if options.mba > 0 {
+                mba::substitute(insn, flags_dead(&function.insns[i..]), options.mba)?
             } else {
                 None
             };
@@ -174,6 +189,20 @@ pub fn transform(function: &Function<'_>, base: u64, options: Options) -> Result
         out.push(Instruction::with2(Code::Lea_r64_m, Register::RSP, stack(FRAME_SIZE - 16))?);
         out.unwind(frames.rows[&function.insns[function.blocks[index].body.start].ip()].clone());
         out.jump(label)?;
+    }
+    let entry_row = frames.rows[&function.insns[function.blocks[0].body.start].ip()].clone();
+    for (offset, state) in states[labels.len()..].iter().enumerate() {
+        out.unwind(Row::dispatcher(&frames.saved));
+        out.bind(state.gate);
+        out.push(Instruction::with2(Code::Movdqu_xmm_xmmm128, Register::XMM14, stack(16))?);
+        out.push(Instruction::with2(Code::Movdqu_xmm_xmmm128, Register::XMM15, stack(32))?);
+        out.push(Instruction::with1(Code::Pop_r64, Register::R11)?);
+        out.unwind(Row::dispatcher(&frames.saved).shifted(-8));
+        out.push(Instruction::with(Code::Popfq));
+        out.unwind(Row::dispatcher(&frames.saved).shifted(-16));
+        out.push(Instruction::with2(Code::Lea_r64_m, Register::RSP, stack(FRAME_SIZE - 16))?);
+        out.unwind(entry_row.clone());
+        out.jump(labels[offset % labels.len()])?;
     }
     let encoded = out.finish(base)?;
     let resumes = resumes

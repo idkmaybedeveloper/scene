@@ -35,7 +35,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
     let mut report = Report::default();
     for function in &functions {
         let candidate = &insns[function.range.clone()];
-        if !passes.cff && !passes.mba {
+        if !passes.cff.on() && !passes.mba.on() {
             report.skip("all code passes disabled");
             continue;
         }
@@ -44,8 +44,8 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
             let len = candidate.len();
             let start = candidate[0].address;
             let options = Options {
-                mba: passes.mba,
-                cff: passes.cff,
+                mba: passes.mba.get(),
+                cff: passes.cff.get(),
                 seed: passes.seed ^ start as u32,
             };
             let output = transform(candidate, destination, options)?;
@@ -73,13 +73,13 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
             Ok(converted) => converted,
             Err(error) => {
                 report.cff_skip(&error);
-                if !passes.mba {
+                if !passes.mba.on() {
                     if dump {
                         eprintln!("{}: skipped: {error:#}", function.name);
                     }
                     continue;
                 }
-                match substitute_function(candidate, &layout, code.len()) {
+                match substitute_function(candidate, &layout, code.len(), passes.mba.get()) {
                     Ok(patches) if !patches.entries.is_empty() => {
                         let count = patches.entries.len();
                         apply(&mut out, offset, base, patches.words);
@@ -160,12 +160,17 @@ struct Patches {
     code: Vec<u8>,
 }
 
-fn substitute_function(insns: &[Insn], layout: &CodeLayout, used: usize) -> Result<Patches> {
+fn substitute_function(
+    insns: &[Insn],
+    layout: &CodeLayout,
+    used: usize,
+    depth: u32,
+) -> Result<Patches> {
     let mut patches = Patches { words: Vec::new(), entries: Vec::new(), code: Vec::new() };
     for index in mba_sites(insns)? {
         let insn = &insns[index];
         let destination = layout.base + (used + patches.code.len()) as u64;
-        let Some(replacement) = substitute(insn, destination)? else { continue };
+        let Some(replacement) = substitute(insn, destination, depth)? else { continue };
         let size = replacement.len() * 4;
         ensure!(layout.fits(used + patches.code.len() + size), "executable padding exhausted");
         let jump = scene_asm::arm64::retarget(0x1400_0000, insn.address, destination)?;
