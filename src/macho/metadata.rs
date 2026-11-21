@@ -73,10 +73,10 @@ fn add_symbol(builder: &mut Builder<'_>, section: SectionId, address: u64) -> Re
 }
 
 fn name() -> Result<Vec<u8>> {
-    let mut bytes = vec![0; 32];
+    let mut bytes = vec![0; 128];
     random(&mut bytes)?;
     for byte in &mut bytes {
-        *byte = b"Il1i"[*byte as usize & 3];
+        *byte = b"li"[*byte as usize & 1];
     }
     Ok(bytes)
 }
