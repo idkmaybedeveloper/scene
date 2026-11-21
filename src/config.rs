@@ -64,6 +64,8 @@ pub struct Config {
     pub input: Option<PathBuf>,
     pub output: Option<PathBuf>,
     pub dump: bool,
+    pub banner: Option<PathBuf>,
+    pub banner_into: Option<String>,
     pub passes: Passes,
 }
 
@@ -72,6 +74,15 @@ impl Config {
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+    }
+
+    pub fn banner_lines(&self) -> Result<Vec<Vec<u8>>> {
+        let Some(path) = &self.banner else { return Ok(Vec::new()) };
+        let text = fs::read(path).with_context(|| format!("reading banner {}", path.display()))?;
+        Ok(text
+            .split(|&b| b == b'\n')
+            .map(|line| line.iter().copied().filter(|&b| b != 0 && b != b'\r').collect::<Vec<u8>>())
+            .collect())
     }
 
     /// loads ./scene.toml when present, otherwise an empty default config so that
@@ -88,6 +99,8 @@ const TEMPLATE: &str = "\
 input = \"path/to/binary\"
 output = \"path/to/binary.obf\"
 dump = false
+# banner = \"notes.txt\"
+# banner_into = \"JNI_OnLoad\"
 
 [passes]
 cff = 1         # control-flow flattening: 0 = off, 1 = default, higher = more states

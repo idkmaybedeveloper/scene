@@ -16,7 +16,14 @@ mod report;
 pub mod x86;
 use report::Report;
 
-pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Result<Vec<u8>> {
+pub fn run(
+    file: &object::File,
+    data: &[u8],
+    dump: bool,
+    passes: &Passes,
+    banner: &[Vec<u8>],
+    banner_into: Option<&str>,
+) -> Result<Vec<u8>> {
     let section = file.section_by_name("__text").context("missing __text section")?;
     let (offset, size) = section.file_range().context("__text has no file data")?;
     let base = section.address();
@@ -33,6 +40,8 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
     let mut code = Vec::new();
     let mut entries = Vec::new();
     let mut report = Report::default();
+    let hook = banner_hook(file, &functions, base, offset, size, banner_into);
+    let mut main_hook: Option<(u64, u64)> = None;
     for function in &functions {
         let candidate = &insns[function.range.clone()];
         if !passes.cff.on() && !passes.mba.on() {
@@ -112,6 +121,9 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
         };
         apply(&mut out, offset, base, bridges);
         moved.extend(&output.moved);
+        if Some(candidate[0].address) == hook {
+            main_hook = Some((output.entry_patch, destination));
+        }
         let code_size = output.insns.len() * 4;
         if dump {
             eprintln!(
@@ -142,9 +154,49 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
         functions: &functions,
         entries: &mut entries,
     })?;
+    let mut protected = Vec::new();
+    if !banner.is_empty() {
+        let destination = layout.base + code.len() as u64;
+        let main = main_hook.map(|(_, dest)| dest);
+        let emitted = scene_passes::arm64::banner::emit(destination, banner, main)?;
+        ensure!(layout.fits(code.len() + emitted.code.len()), "banner exceeds executable space");
+        protected.push(destination..destination + emitted.code.len() as u64);
+        code.extend_from_slice(&emitted.code);
+        entries.extend_from_slice(&emitted.entries);
+        match main_hook {
+            Some((entry_patch, _)) => {
+                let shim = scene_asm::arm64::retarget(0x1400_0000, entry_patch, destination)?;
+                apply(&mut out, offset, base, vec![(entry_patch, shim)]);
+                eprintln!("banner: {} lines woven into main at {destination:#x}", banner.len());
+            }
+            None => eprintln!("banner: {} lines embedded at {destination:#x}", banner.len()),
+        }
+    }
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible instructions to transform");
-    layout.finish(&out, code, &entries)
+    layout.finish(&out, code, &entries, &protected)
+}
+
+/// address of the function the banner should be woven into: the named symbol when given,
+/// otherwise the binary's entry point (if it lands in __text). none disables weaving
+fn banner_hook(
+    file: &object::File,
+    functions: &[functions::Function],
+    base: u64,
+    offset: u64,
+    size: u64,
+    into: Option<&str>,
+) -> Option<u64> {
+    match into {
+        Some(name) => {
+            functions.iter().find(|f| f.name == name).map(|f| base + f.range.start as u64 * 4)
+        }
+        None => {
+            // LC_MAIN's entryoff is a file offset; map it back to a __text virtual address
+            let entry = base + file.entry().checked_sub(offset)?;
+            (base..base + size).contains(&entry).then_some(entry)
+        }
+    }
 }
 
 fn apply(out: &mut [u8], offset: u64, base: u64, words: Vec<(u64, u32)>) {

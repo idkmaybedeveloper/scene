@@ -1,3 +1,4 @@
+pub mod banner;
 mod cff;
 mod cfg;
 mod emit;

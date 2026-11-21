@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use anyhow::{Context, Result, ensure};
 use object::{
     Architecture, Endianness, Object, ObjectSection, ObjectSegment,
@@ -151,8 +153,14 @@ impl CodeLayout {
         matches!(self.placement, Placement::Padding { .. })
     }
 
-    pub fn finish(self, data: &[u8], code: Vec<u8>, entries: &[u64]) -> Result<Vec<u8>> {
-        self.finish_with_unwind(data, code, entries, None)
+    pub fn finish(
+        self,
+        data: &[u8],
+        code: Vec<u8>,
+        entries: &[u64],
+        protected: &[Range<u64>],
+    ) -> Result<Vec<u8>> {
+        self.finish_with_unwind(data, code, entries, None, protected)
     }
 
     pub fn finish_with_unwind(
@@ -161,6 +169,7 @@ impl CodeLayout {
         code: Vec<u8>,
         entries: &[u64],
         unwind: Option<super::unwind::Section>,
+        protected: &[Range<u64>],
     ) -> Result<Vec<u8>> {
         let original = object::File::parse(data)?;
         let mut builder = Builder::read(data).context("reading image for rebuild")?;
@@ -216,7 +225,7 @@ impl CodeLayout {
         };
         let mut starts = functions::starts(&original)?;
         starts.extend_from_slice(entries);
-        metadata::apply(&mut builder, &mut starts, entries, code_end)?;
+        metadata::apply(&mut builder, &mut starts, entries, code_end, protected)?;
         starts.sort_unstable();
         starts.dedup();
         let mut encoded = Vec::new();

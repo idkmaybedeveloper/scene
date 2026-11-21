@@ -228,10 +228,7 @@ fn split_blocks(
             since = 0;
             continue;
         }
-        if next == prev + 1
-            && insns[prev].flow_control() == FlowControl::Next
-            && since >= step
-        {
+        if next == prev + 1 && insns[prev].flow_control() == FlowControl::Next && since >= step {
             if leaders.len() >= 128 {
                 break;
             }

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use anyhow::{Result, anyhow};
 use object::{
@@ -11,6 +12,7 @@ pub fn apply(
     starts: &mut Vec<u64>,
     entries: &[u64],
     code_end: u64,
+    protected: &[Range<u64>],
 ) -> Result<()> {
     let executable: Vec<_> = builder
         .sections
@@ -49,6 +51,9 @@ pub fn apply(
         random(&mut choices)?;
         for choice in choices {
             let address = pair[0] + 4 * (1 + choice as u64 % 5);
+            if protected.iter().any(|range| range.contains(&address)) {
+                continue;
+            }
             if !occupied.insert(address) {
                 continue;
             }

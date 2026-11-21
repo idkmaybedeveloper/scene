@@ -6,11 +6,22 @@ use scene_disasm::Arch;
 
 use crate::{config::Passes, macho, passes};
 
-pub fn rewrite(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Result<Vec<u8>> {
+pub fn rewrite(
+    file: &object::File,
+    data: &[u8],
+    dump: bool,
+    passes: &Passes,
+    banner: &[Vec<u8>],
+    banner_into: Option<&str>,
+) -> Result<Vec<u8>> {
     if file.format() == BinaryFormat::MachO {
         match file.architecture() {
-            Architecture::Aarch64 => return passes::run(file, data, dump, passes),
-            Architecture::X86_64 => return passes::x86::run(file, data, dump, passes),
+            Architecture::Aarch64 => {
+                return passes::run(file, data, dump, passes, banner, banner_into);
+            }
+            Architecture::X86_64 => {
+                return passes::x86::run(file, data, dump, passes, banner, banner_into);
+            }
             _ => {}
         }
     }

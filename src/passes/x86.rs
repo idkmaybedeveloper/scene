@@ -19,7 +19,14 @@ use crate::macho::{
     unwind::Unwind,
 };
 
-pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Result<Vec<u8>> {
+pub fn run(
+    file: &object::File,
+    data: &[u8],
+    dump: bool,
+    passes: &Passes,
+    banner: &[Vec<u8>],
+    banner_into: Option<&str>,
+) -> Result<Vec<u8>> {
     ensure!(
         !file.segments().any(|s| s.name().ok().flatten() == Some("__SCENE")),
         "binary already contains scene"
@@ -112,6 +119,15 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
     let mut code = Vec::new();
     let mut entries = Vec::new();
     let mut report = Report::default();
+    let hook = match banner_into {
+        Some(name) => file.symbols().find(|s| s.name().ok() == Some(name)).map(|s| s.address()),
+        None => file
+            .entry()
+            .checked_sub(offset)
+            .map(|d| base + d)
+            .filter(|a| (base..base + size).contains(a)),
+    };
+    let mut main_hook: Option<(u64, u64)> = None;
     if dump {
         print!("; __text @ {base:#x}\n{}", Listing::X86 { bitness: 64, insns: insns.clone() });
     }
@@ -168,6 +184,9 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
                     }
                     report.cff += 1;
                     report.substitutions += output.substitutions;
+                    if Some(range.start) == hook {
+                        main_hook = Some((output.entry_patch, destination));
+                    }
                     entries.push(destination);
                     entries.extend(output.resumes.values().copied());
                     moved.extend(output.moved);
@@ -193,8 +212,11 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
             }
             let destination = layout.base + code.len() as u64;
             let converted = (|| -> Result<_> {
-                let Some(bytes) =
-                    scene_passes::x86::substitute(&decoded[index..], destination, passes.mba.get())?
+                let Some(bytes) = scene_passes::x86::substitute(
+                    &decoded[index..],
+                    destination,
+                    passes.mba.get(),
+                )?
                 else {
                     return Ok(None);
                 };
@@ -249,9 +271,28 @@ pub fn run(file: &object::File, data: &[u8], dump: bool, passes: &Passes) -> Res
         rows: &source_rows,
         after: &source_after,
     })?;
+    let mut protected = Vec::new();
+    if !banner.is_empty() {
+        let destination = layout.base + code.len() as u64;
+        let main = main_hook.map(|(_, dest)| dest);
+        let embedded = scene_passes::x86::banner::emit(destination, banner, main)?;
+        ensure!(layout.fits(code.len() + embedded.code.len()), "banner exceeds executable space");
+        protected.push(destination..destination + embedded.code.len() as u64);
+        code.extend(embedded.code);
+        entries.extend_from_slice(&embedded.entries);
+        match main_hook {
+            Some((entry_patch, _)) => {
+                let at = (offset + entry_patch - base) as usize;
+                let shim = scene_asm::x86::jump(entry_patch, destination)?;
+                out[at..at + shim.len()].copy_from_slice(&shim);
+                eprintln!("banner: {} lines woven into main at {destination:#x}", banner.len());
+            }
+            None => eprintln!("banner: {} lines embedded at {destination:#x}", banner.len()),
+        }
+    }
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible x86_64 instructions to transform");
-    layout.finish_with_unwind(&out, code, &entries, Some(unwind.finish()))
+    layout.finish_with_unwind(&out, code, &entries, Some(unwind.finish()), &protected)
 }
 
 struct Bridge {
