@@ -1,7 +1,37 @@
+mod cff;
+mod cfg;
+mod emit;
 mod mba;
+
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 use iced_x86::{FlowControl, Instruction, Mnemonic};
+
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    pub mba: bool,
+    pub seed: u32,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { mba: true, seed: 0x7363_656e }
+    }
+}
+
+pub struct Output {
+    pub code: Vec<u8>,
+    pub blocks: usize,
+    pub substitutions: usize,
+    pub entry_patch: u64,
+    pub resumes: BTreeMap<u64, u64>,
+    pub moved: BTreeMap<u64, u64>,
+}
+
+pub fn transform(insns: &[Instruction], base: u64, options: Options) -> Result<Output> {
+    cff::transform(&cfg::Function::parse(insns)?, base, options)
+}
 
 pub fn substitute(insns: &[Instruction], base: u64) -> Result<Option<Vec<u8>>> {
     let Some(insn) = insns.first() else { return Ok(None) };

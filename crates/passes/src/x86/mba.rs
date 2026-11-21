@@ -4,7 +4,13 @@ use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 pub fn substitute(insn: &Instruction, flags_dead: bool) -> Result<Option<Vec<Instruction>>> {
     if insn.op_count() != 2
         || insn.op0_kind() != OpKind::Register
-        || !matches!(insn.op1_kind(), OpKind::Immediate32 | OpKind::Immediate32to64)
+        || !matches!(
+            insn.op1_kind(),
+            OpKind::Immediate32
+                | OpKind::Immediate32to64
+                | OpKind::Immediate8to32
+                | OpKind::Immediate8to64
+        )
         || insn.has_lock_prefix()
         || insn.has_rep_prefix()
         || insn.has_repne_prefix()
@@ -19,7 +25,7 @@ pub fn substitute(insn: &Instruction, flags_dead: bool) -> Result<Option<Vec<Ins
     }
     let wide = register.is_gpr64();
     let not = Instruction::with1(if wide { Code::Not_rm64 } else { Code::Not_rm32 }, register)?;
-    let immediate = insn.immediate32() as i32;
+    let immediate = insn.immediate(1) as i32;
     let binary = |narrow, wide_code, value: i32| {
         Instruction::with2(if wide { wide_code } else { narrow }, register, value)
     };
