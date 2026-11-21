@@ -11,6 +11,8 @@ use scene_passes::x86::unwind as frames;
 use scene_passes::x86::{Options, Output};
 
 use super::report::Report;
+use super::vm::Pending;
+use super::x86_vm;
 use crate::config::Passes;
 use crate::macho::{
     self, functions,
@@ -27,7 +29,6 @@ pub fn run(
     banner: &[Vec<u8>],
     banner_into: Option<&str>,
 ) -> Result<Vec<u8>> {
-    ensure!(!passes.vm.on(), "vm is currently supported only for ARM64");
     ensure!(
         !file.segments().any(|s| s.name().ok().flatten() == Some("__SCENE")),
         "binary already contains scene"
@@ -129,6 +130,12 @@ pub fn run(
             .filter(|a| (base..base + size).contains(a)),
     };
     let mut main_hook: Option<(u64, u64)> = None;
+    let vm_functions = x86_vm::select(file, &insns, &starts, &passes.vm, passes.seed, &mut report)?;
+    let vm_addresses = strings.vm_addresses(&layout);
+    let mut virtualized = BTreeSet::new();
+    let mut vm_entries = BTreeMap::new();
+    let mut bindings = Vec::new();
+    let mut protected = Vec::new();
     if dump {
         print!("; __text @ {base:#x}\n{}", Listing::X86 { bitness: 64, insns: insns.clone() });
     }
@@ -141,6 +148,76 @@ pub fn run(
             report.skip("data or invalid function boundary");
             continue;
         };
+        if vm_functions.contains(&range.start) {
+            let destination = layout.base + code.len() as u64;
+            let converted = (|| -> Result<_> {
+                let seed = passes.seed ^ range.start as u32;
+                let output = scene_passes::x86::vm::transform(
+                    &decoded,
+                    destination,
+                    scene_passes::x86::vm::Options {
+                        seed,
+                        anchors: x86_vm::anchors(&insns, seed),
+                        addresses: vm_addresses
+                            .range(range.clone())
+                            .map(|(&a, &b)| (a, b))
+                            .collect(),
+                        ..Default::default()
+                    },
+                )?;
+                ensure!(
+                    layout.fits(code.len() + output.code.len()),
+                    "executable padding exhausted"
+                );
+                unwind.add(destination, output.code.len(), &output.unwind)?;
+                Ok(output)
+            })();
+            match converted {
+                Ok(output) => {
+                    // obliterate the original reachable instructions; the entry gets its jump
+                    // to the vm code installed later (through strings, or directly when there
+                    // are no encrypted strings)
+                    let lengths: BTreeMap<_, _> =
+                        decoded.iter().map(|i| (i.ip(), i.len())).collect();
+                    for &source in &output.sources {
+                        if let Some(&len) = lengths.get(&source) {
+                            let at = (offset + source - base) as usize;
+                            out[at..at + len].fill(0xcc);
+                        }
+                    }
+                    virtualized.extend(output.sources.iter().copied());
+                    vm_entries.insert(output.entry_patch, destination);
+                    if dump {
+                        log::info!(
+                            "{:#x} -> {destination:#x}: vm, {} instructions, {} bytecode bytes, {} bytes",
+                            range.start,
+                            output.instructions,
+                            output.bytecode.len(),
+                            output.code.len()
+                        );
+                    }
+                    protected.push(
+                        destination + output.bytecode.start as u64
+                            ..destination + output.bytecode.end as u64,
+                    );
+                    entries.push(destination);
+                    report.vm += 1;
+                    report.vm_instructions += output.instructions;
+                    report.vm_bytecode += output.bytecode.len();
+                    report.vm_handlers += output.handlers;
+                    bindings.push(Pending {
+                        range: code.len()..code.len() + output.code.len(),
+                        binding: output.binding,
+                    });
+                    code.extend(output.code);
+                    continue;
+                }
+                Err(error) => {
+                    report.vm_skip(&error);
+                    log::warn!("{:#x}: vm skipped: {error:#}", range.start);
+                }
+            }
+        }
         if !passes.cff.on() && !passes.mba.on() {
             report.untouched += 1;
             continue;
@@ -261,6 +338,7 @@ pub fn run(
         }
     }
     unwind.release();
+    let strings_encrypt = strings.storage_size() != 0;
     strings.apply(StringRewrite {
         file,
         out: &mut out,
@@ -271,8 +349,18 @@ pub fn run(
         unwind: &mut unwind,
         rows: &source_rows,
         after: &source_after,
+        virtualized: &virtualized,
+        vm_entries: &vm_entries,
     })?;
-    let mut protected = Vec::new();
+    // strings.apply installs the guarded vm entry jumps only when it actually encrypts
+    // something; with nothing to encrypt it bails early, so patch those entries directly here
+    if !strings_encrypt {
+        for (&entry, &destination) in &vm_entries {
+            let jump = scene_asm::x86::jump(entry, destination)?;
+            let at = (offset + entry - base) as usize;
+            out[at..at + jump.len()].copy_from_slice(&jump);
+        }
+    }
     if !banner.is_empty() {
         let destination = layout.base + code.len() as u64;
         let main = main_hook.map(|(_, dest)| dest);
@@ -291,6 +379,7 @@ pub fn run(
             None => log::info!("banner: {} lines embedded at {destination:#x}", banner.len()),
         }
     }
+    super::vm::seal(&mut code, bindings, &out, offset, base)?;
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible x86_64 instructions to transform");
     layout.finish_with_unwind(&out, code, &entries, Some(unwind.finish()), &protected)

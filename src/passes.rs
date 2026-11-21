@@ -15,6 +15,7 @@ use crate::macho::{
 mod report;
 mod vm;
 pub mod x86;
+mod x86_vm;
 use report::Report;
 
 pub fn run(

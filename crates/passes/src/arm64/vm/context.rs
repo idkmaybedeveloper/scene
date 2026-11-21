@@ -4,7 +4,7 @@ pub const SP_OFFSET: u32 = 32 * 8;
 pub const FLAGS_OFFSET: u32 = SP_OFFSET + 8;
 pub const PLAINTEXT_OFFSET: u32 = 352;
 pub const NZCV: u32 = 0x5a10;
-pub const STATE_SIZE: u32 = 368;
+pub const STATE_SIZE: u32 = 384;
 pub const FRAME_SIZE: u32 = STATE_SIZE + 128;
 
 use super::mutation::Mutation;

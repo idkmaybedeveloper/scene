@@ -23,7 +23,6 @@ pub struct Mutation {
     pub fields: [u32; 4],
     pub header: u32,
     pub immediate: u32,
-    pub stride: usize,
 }
 
 impl Mutation {
@@ -65,7 +64,6 @@ impl Mutation {
             fields,
             header,
             immediate: 8 - header,
-            stride: if rng.gen_bool(0.5) { 32 } else { 64 },
             rng,
         })
     }

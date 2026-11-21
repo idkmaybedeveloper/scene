@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use anyhow::{Result, ensure};
 use dynasmrt::{
@@ -31,6 +32,10 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
     ensure!(base.is_multiple_of(4), "vm: unaligned output address");
     ensure!(options.strength <= 4, "vm: strength exceeds 4");
     let mut mutation = Mutation::new(options.seed, options.mutation_seed)?;
+    let records = crate::vm::Records::new(program.records.len(), 32, &mut mutation.rng);
+    let table_dispatch = mutation.rng.gen_bool(0.5);
+    let table_key = mutation.rng.r#gen::<u64>();
+    let table_rotation = mutation.rng.gen_range(1..64u32);
     let r = mutation.registers.clone();
     let mut asm = Assembler::new(base.try_into()?);
     let dispatch = asm.new_dynamic_label();
@@ -91,7 +96,10 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         ; mov X(r.pc), X(r.base)
         ; =>dispatch
     );
-    cipher::decode(&mut asm, keys, nonce, &mutation);
+    cipher::decode(&mut asm, keys, nonce, &mutation, 0);
+    dynasm!(asm; .arch aarch64; add XSP(r.pc), XSP(r.pc), #16);
+    cipher::decode(&mut asm, keys, nonce, &mutation, 16);
+    dynasm!(asm; .arch aarch64; sub XSP(r.pc), XSP(r.pc), #16);
     dynasm!(asm; .arch aarch64
         ; ldrb W(r.opcode), [sp, PLAINTEXT_OFFSET + mutation.header + mutation.fields[0]]
         ; ldrb W(r.dst), [sp, PLAINTEXT_OFFSET + mutation.header + mutation.fields[1]]
@@ -99,7 +107,9 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         ; ldrb W(r.rhs), [sp, PLAINTEXT_OFFSET + mutation.header + mutation.fields[3]]
         ; ldr W(r.aux), [sp, PLAINTEXT_OFFSET + mutation.header + 4]
         ; ldr X(r.immediate), [sp, PLAINTEXT_OFFSET + mutation.immediate]
-        ; add XSP(r.pc), XSP(r.pc), mutation.stride as u32
+        ; lsr W(r.scratch), W(r.aux), #24
+        ; add XSP(r.pc), XSP(r.pc), X(r.scratch)
+        ; and WSP(r.aux), W(r.aux), #0xffffff
         ; cmp WSP(r.opcode), handlers.len() as u32
         ; b.hi =>invalid
         ; cbz W(r.opcode), =>invalid
@@ -120,10 +130,29 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         ; =>immediate
         ; mov X(r.rhs), X(r.immediate)
         ; =>loaded
-        ; adr X(r.scratch), =>table
-        ; ldrsw X(r.opcode), [X(r.scratch), X(r.opcode), LSL #2]
-        ; add X(r.scratch), X(r.scratch), X(r.opcode)
-        ; br X(r.scratch)
+    );
+    if table_dispatch {
+        dynasm!(asm; .arch aarch64
+            ; adr X(r.scratch), =>table
+            ; ldr X(r.opcode), [X(r.scratch), X(r.opcode), LSL #3]
+            ; fmov d4, X(r.aux)
+            ; umov X(r.aux), v3.d[0]
+            ; eor X(r.opcode), X(r.opcode), X(r.aux)
+        );
+        cipher::constant(&mut asm, r.aux, table_key);
+        dynasm!(asm; .arch aarch64
+            ; eor X(r.opcode), X(r.opcode), X(r.aux)
+            ; ror X(r.opcode), X(r.opcode), table_rotation
+            ; fmov X(r.aux), d4
+            ; add X(r.scratch), X(r.scratch), X(r.opcode)
+            ; br X(r.scratch)
+        );
+    } else {
+        let mut sorted: Vec<_> = handlers.iter().collect();
+        sorted.sort_by_key(|h| h.code);
+        dispatch_tree(&mut asm, &sorted, r.opcode, invalid);
+    }
+    dynasm!(asm; .arch aarch64
         ; =>invalid
         ; hint #36
         ; brk #0
@@ -155,27 +184,31 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         cipher::restore(&mut asm, &anchors, &mutation);
         dynasm!(asm; .arch aarch64; adr X(r.base), =>bytecode);
         let index = program.sources.iter().position(|i| i.address == address).unwrap();
-        cipher::constant(&mut asm, r.pc, (index * mutation.stride) as u64);
+        cipher::constant(&mut asm, r.pc, records.offsets[index] as u64);
         dynasm!(asm; .arch aarch64; add X(r.pc), X(r.pc), X(r.base); b =>dispatch);
         regions.push(start..asm.offset().0);
     }
     dynasm!(asm; .arch aarch64; =>table);
     let table_offset = asm.offset().0 as i64;
+    let table_start = asm.offset().0;
     let mut targets = vec![invalid; handlers.len() + 1];
     for handler in &handlers {
         targets[handler.code as usize] = handler.label;
     }
-    for label in targets {
-        let delta = asm.labels().resolve_dynamic(label)?.0 as i64 - table_offset;
-        asm.extend(i32::try_from(delta)?.to_le_bytes());
+    if table_dispatch {
+        for label in targets {
+            let delta = asm.labels().resolve_dynamic(label)?.0 as i64 - table_offset;
+            asm.extend(((delta as u64).rotate_left(table_rotation) ^ table_key).to_le_bytes());
+        }
     }
-    let mut plaintext = vec![0; program.records.len() * mutation.stride];
+    let table_end = asm.offset().0;
+    let mut plaintext = vec![0; records.len()];
     let bytecode_address = base + ((asm.offset().0 + 15) & !15) as u64 + 352 + 32;
     mutation.rng.fill(&mut plaintext[..]);
     let mut listing = Vec::new();
     for (index, (record, source)) in program.records.iter().zip(&program.sources).enumerate() {
         let code = *aliases[&record.opcode].choose(&mut mutation.rng).unwrap();
-        let bytes = &mut plaintext[index * mutation.stride..][..mutation.stride];
+        let bytes = &mut plaintext[records.offsets[index]..records.offsets[index + 1]];
         let fields = [
             code,
             mutation.slot(record.dst),
@@ -185,15 +218,17 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         for (field, value) in mutation.fields.iter().zip(fields) {
             bytes[mutation.header as usize + *field as usize] = value;
         }
-        let aux = if matches!(record.opcode.kind, Kind::LoadPair | Kind::StorePair) {
+        let aux = if record.opcode.kind == Kind::MovePair {
+            u32::from(mutation.slot((record.aux >> 16) as u8)) << 16
+        } else if matches!(record.opcode.kind, Kind::LoadPair | Kind::StorePair) {
             u32::from(mutation.slot(record.aux as u8))
         } else {
             record.aux
         };
         bytes[mutation.header as usize + 4..mutation.header as usize + 8]
-            .copy_from_slice(&aux.to_le_bytes());
+            .copy_from_slice(&(aux | (records.size(index) as u32) << 24).to_le_bytes());
         let immediate = if record.target.is_some() {
-            record.immediate / RECORD_SIZE as u64 * mutation.stride as u64
+            records.offsets[record.immediate as usize / RECORD_SIZE] as u64
         } else if record.opcode.kind == Kind::Address {
             record.immediate.wrapping_sub(bytecode_address)
         } else if record.opcode.kind == Kind::Call {
@@ -203,10 +238,11 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         };
         bytes[mutation.immediate as usize..mutation.immediate as usize + 8]
             .copy_from_slice(&immediate.to_le_bytes());
+        bytes[16..24].copy_from_slice(&record.extra.to_le_bytes());
         let mut displayed = record.clone();
         displayed.immediate = immediate;
         listing.push(super::DumpRow {
-            offset: index * mutation.stride,
+            offset: records.offsets[index],
             source: source.address,
             source_text: source.decode().unwrap().to_string(),
             opcode: code,
@@ -241,9 +277,18 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         bytecode: start..end,
         instructions: program.records.len(),
         entry_patch: program.entry_patch,
-        sources: program.sources.iter().map(|i| i.address).collect(),
+        sources: program
+            .sources
+            .iter()
+            .map(|i| i.address)
+            .chain(program.elided.iter().copied())
+            .collect(),
         listing,
-        binding: Binding { anchors, keys: key_start..key_end },
+        binding: Binding {
+            anchors,
+            keys: key_start..key_end,
+            tables: if table_dispatch { vec![Range { start: table_start, end: table_end }] } else { Vec::new() },
+        },
         raw_runtime_size,
         runtime_size,
         substitutions,
@@ -252,6 +297,21 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         kept: calls.iter().copied().collect(),
         resumes,
     })
+}
+
+#[allow(clippy::useless_conversion)]
+fn dispatch_tree(asm: &mut Assembler, handlers: &[&Handler], register: u8, invalid: DynamicLabel) {
+    if handlers.is_empty() {
+        dynasm!(asm; .arch aarch64; b =>invalid);
+        return;
+    }
+    let middle = handlers.len() / 2;
+    let handler = handlers[middle];
+    let upper = asm.new_dynamic_label();
+    dynasm!(asm; .arch aarch64; cmp WSP(register), u32::from(handler.code); b.eq =>handler.label; b.hi =>upper);
+    dispatch_tree(asm, &handlers[..middle], register, invalid);
+    dynasm!(asm; .arch aarch64; =>upper);
+    dispatch_tree(asm, &handlers[middle + 1..], register, invalid);
 }
 
 #[allow(clippy::useless_conversion)]
@@ -329,6 +389,21 @@ fn handler(
                 dynasm!(asm; .arch aarch64; mov X(r.lhs), X(r.immediate));
                 identity(asm, mutation, variant);
             }
+            if !wide {
+                dynasm!(asm; .arch aarch64; mov W(r.lhs), W(r.lhs));
+            }
+            dynasm!(asm; .arch aarch64; b =>store);
+        }
+        Kind::MovePair => {
+            dynasm!(asm; .arch aarch64; mov X(r.lhs), X(r.immediate));
+            if !wide {
+                dynasm!(asm; .arch aarch64; mov W(r.lhs), W(r.lhs));
+            }
+            dynasm!(asm; .arch aarch64
+                ; str X(r.lhs), [sp, X(r.dst), LSL #3]
+                ; ldr X(r.lhs), [sp, PLAINTEXT_OFFSET + 16]
+                ; ubfx X(r.dst), X(r.aux), #16, #8
+            );
             if !wide {
                 dynasm!(asm; .arch aarch64; mov W(r.lhs), W(r.lhs));
             }

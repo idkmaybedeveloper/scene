@@ -38,6 +38,40 @@ pub fn lift(insns: &[Insn]) -> Result<Program> {
         }
         records.insert(insn.address, translated);
     }
+    let mut protected = BTreeSet::from([start]);
+    for (address, translated) in &records {
+        for record in translated {
+            protected.extend(record.target);
+            if record.opcode.kind == Kind::Call {
+                protected.insert(address + 4);
+            }
+        }
+    }
+    let addresses: Vec<_> = records.keys().copied().collect();
+    let mut elided = Vec::new();
+    for pair in addresses.windows(2) {
+        let (first, next) = (pair[0], pair[1]);
+        if next != first + 4 || protected.contains(&next) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (records.get(&first), records.get(&next)) else { continue };
+        if a.len() != 1
+            || b.len() != 1
+            || a[0].opcode.kind != Kind::Move
+            || b[0].opcode != a[0].opcode
+            || a[0].dst >= 31
+            || b[0].dst >= 31
+        {
+            continue;
+        }
+        let second = b[0].clone();
+        let first = &mut records.get_mut(&first).unwrap()[0];
+        first.opcode.kind = Kind::MovePair;
+        first.aux = u32::from(second.dst) << 16;
+        first.extra = second.immediate;
+        records.remove(&next);
+        elided.push(next);
+    }
     let mut offsets = BTreeMap::new();
     let mut sources = Vec::new();
     let mut flattened = Vec::new();
@@ -64,7 +98,7 @@ pub fn lift(insns: &[Insn]) -> Result<Program> {
                 && source.address == entry_patch),
         "vm: call overlaps entry trampoline"
     );
-    Ok(Program { records, sources, entry_patch })
+    Ok(Program { records, sources, entry_patch, elided })
 }
 
 fn translate(insn: &Insn) -> Result<Vec<Record>> {

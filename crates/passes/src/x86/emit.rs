@@ -18,6 +18,7 @@ pub struct Emitter {
     moved: BTreeMap<u64, Label>,
     unwind: Vec<(Label, Row)>,
     row: Option<Row>,
+    data: Vec<(Label, Vec<u8>)>,
 }
 
 pub struct Encoded {
@@ -48,6 +49,7 @@ impl Emitter {
             moved: BTreeMap::new(),
             unwind: Vec::new(),
             row: None,
+            data: Vec::new(),
         }
     }
 
@@ -64,6 +66,17 @@ impl Emitter {
 
     pub fn push(&mut self, insn: Instruction) {
         self.insns.push(insn);
+    }
+
+    pub fn reference(&mut self, insn: Instruction, label: Label) {
+        self.references.push((self.insns.len(), label));
+        self.push(insn);
+    }
+
+    pub fn data(&mut self, bytes: Vec<u8>) -> Label {
+        let label = self.label();
+        self.data.push((label, bytes));
+        label
     }
 
     pub fn unwind(&mut self, row: Row) {
@@ -115,6 +128,12 @@ impl Emitter {
     }
 
     pub fn finish(mut self, base: u64) -> Result<Encoded> {
+        for (label, bytes) in std::mem::take(&mut self.data) {
+            self.labels[label.0] = Some(self.insns.len());
+            for chunk in bytes.chunks(16) {
+                self.push(Instruction::with_declare_byte(chunk)?);
+            }
+        }
         for (value, label) in std::mem::take(&mut self.vectors) {
             self.labels[label.0] = Some(self.insns.len());
             self.push(Instruction::with_declare_byte(&value)?);

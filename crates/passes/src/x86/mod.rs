@@ -5,6 +5,7 @@ mod emit;
 mod mba;
 pub mod strings;
 pub mod unwind;
+pub mod vm;
 pub use emit::Encoded as GeneratedCode;
 
 use std::collections::BTreeMap;

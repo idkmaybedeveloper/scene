@@ -190,6 +190,28 @@ pub fn reference(
     row: &Row,
     after: &Row,
 ) -> Result<GeneratedCode> {
+    let mut out = guarded(state, initialize, row)?;
+    let mut reference = *original;
+    reference.set_memory_displacement64(target);
+    out.push(reference);
+    out.unwind(after.clone());
+    out.jump_to(original.next_ip())?;
+    out.finish(base)
+}
+
+pub fn guard(
+    base: u64,
+    state: u64,
+    initialize: u64,
+    target: u64,
+    row: &Row,
+) -> Result<GeneratedCode> {
+    let mut out = guarded(state, initialize, row)?;
+    out.jump_to(target)?;
+    out.finish(base)
+}
+
+fn guarded(state: u64, initialize: u64, row: &Row) -> Result<Emitter> {
     let mut out = Emitter::new();
     out.unwind(row.clone());
     let ready = out.label();
@@ -236,12 +258,7 @@ pub fn reference(
     out.unwind(row.shifted(128));
     out.push(Instruction::with2(Code::Lea_r64_m, Register::RSP, memory(Register::RSP, 128))?);
     out.unwind(row.clone());
-    let mut reference = *original;
-    reference.set_memory_displacement64(target);
-    out.push(reference);
-    out.unwind(after.clone());
-    out.jump_to(original.next_ip())?;
-    out.finish(base)
+    Ok(out)
 }
 
 fn memory(base: Register, displacement: i64) -> MemoryOperand {

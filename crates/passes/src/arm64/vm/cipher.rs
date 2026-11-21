@@ -1,6 +1,3 @@
-use std::ops::Range;
-
-use anyhow::{Context, Result};
 use dynasmrt::{
     DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation, dynasm,
 };
@@ -10,34 +7,7 @@ use super::{context::PLAINTEXT_OFFSET, mutation::Mutation};
 
 type Assembler = VecAssembler<Aarch64Relocation>;
 
-pub struct Anchor {
-    pub address: u64,
-    salt: u64,
-    rotation: u32,
-}
-
-pub struct Binding {
-    pub anchors: Vec<Anchor>,
-    pub keys: Range<usize>,
-}
-
-impl Binding {
-    pub fn seal(self, code: &mut [u8], mut read: impl FnMut(u64) -> Result<u32>) -> Result<()> {
-        let mut hash = 0u64;
-        for anchor in self.anchors {
-            hash = (hash ^ u64::from(read(anchor.address)?))
-                .rotate_right(anchor.rotation)
-                .wrapping_add(anchor.salt);
-        }
-        let key_bytes = code.get_mut(self.keys).context("vm: key data outside output")?;
-        for pair in key_bytes.as_chunks_mut::<32>().0 {
-            for (index, byte) in pair[16..].iter_mut().enumerate() {
-                *byte ^= hash.to_le_bytes()[index % 8];
-            }
-        }
-        Ok(())
-    }
-}
+pub use crate::vm::{Anchor, Binding};
 
 #[allow(clippy::useless_conversion)]
 pub fn bind(asm: &mut Assembler, addresses: &[u64], mutation: &mut Mutation) -> Vec<Anchor> {
@@ -73,7 +43,13 @@ pub fn restore(asm: &mut Assembler, anchors: &[Anchor], mutation: &Mutation) {
 }
 
 #[allow(clippy::useless_conversion)]
-pub fn decode(asm: &mut Assembler, keys: DynamicLabel, nonce: DynamicLabel, mutation: &Mutation) {
+pub fn decode(
+    asm: &mut Assembler,
+    keys: DynamicLabel,
+    nonce: DynamicLabel,
+    mutation: &Mutation,
+    offset: u32,
+) {
     let r = &mutation.registers;
     let round = asm.new_dynamic_label();
     dynasm!(asm; .arch aarch64
@@ -112,7 +88,7 @@ pub fn decode(asm: &mut Assembler, keys: DynamicLabel, nonce: DynamicLabel, muta
         ; eor v0.b16, v0.b16, v1.b16
         ; ldr q4, [X(r.pc)]
         ; eor v4.b16, v4.b16, v0.b16
-        ; str q4, [sp, PLAINTEXT_OFFSET]
+        ; str q4, [sp, PLAINTEXT_OFFSET + offset]
     );
 }
 

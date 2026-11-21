@@ -30,6 +30,8 @@ pub struct Strings {
 }
 
 pub struct Rewrite<'a, 'data> {
+    pub virtualized: &'a BTreeSet<u64>,
+    pub vm_entries: &'a BTreeMap<u64, u64>,
     pub file: &'a object::File<'data>,
     pub out: &'a mut [u8],
     pub code: &'a mut Vec<u8>,
@@ -130,6 +132,13 @@ impl Strings {
         if self.values.is_empty() { 0 } else { self.size + 16 }
     }
 
+    pub fn vm_addresses(&self, layout: &CodeLayout) -> BTreeMap<u64, u64> {
+        self.references
+            .iter()
+            .map(|i| (i.ip(), layout.data_base + 16 + i.ip_rel_memory_address() - self.start))
+            .collect()
+    }
+
     pub fn unwind_budget(&self) -> usize {
         if self.values.is_empty() {
             0
@@ -147,7 +156,19 @@ impl Strings {
     }
 
     pub fn apply(self, rewrite: Rewrite<'_, '_>) -> Result<()> {
-        let Rewrite { file, out, code, layout, moved, entries, unwind, rows, after } = rewrite;
+        let Rewrite {
+            file,
+            out,
+            code,
+            layout,
+            moved,
+            entries,
+            unwind,
+            rows,
+            after,
+            virtualized,
+            vm_entries,
+        } = rewrite;
         if self.values.is_empty() {
             log::info!("strings: 0 encrypted, {} kept", self.kept);
             return Ok(());
@@ -181,7 +202,26 @@ impl Strings {
         unwind.add(initialize, generated.code.len(), &generated.unwind)?;
         code.extend(generated.code);
         entries.push(initialize);
+        for (&entry, &destination) in vm_entries {
+            let base = layout.base + code.len() as u64;
+            let generated =
+                native::guard(base, layout.data_base, initialize, destination, &Row::leaf())?;
+            unwind.add(base, generated.code.len(), &generated.unwind)?;
+            entries.push(base);
+            code.extend(generated.code);
+            let patch = scene_asm::x86::jump(entry, base)?;
+            let section = file
+                .sections()
+                .find(|s| (s.address()..s.address() + s.size()).contains(&entry))
+                .context("unmapped vm entry")?;
+            let (offset, _) = section.file_range().context("vm entry has no data")?;
+            let at = (offset + entry - section.address()) as usize;
+            out[at..at + patch.len()].copy_from_slice(&patch);
+        }
         for reference in self.references {
+            if virtualized.contains(&reference.ip()) {
+                continue;
+            }
             let row = &rows[&reference.ip()];
             let after = &after[&reference.ip()];
             let target = reference.ip_rel_memory_address();

@@ -10,6 +10,7 @@ pub enum Kind {
     Or,
     Xor,
     Move,
+    MovePair,
     Keep,
     Jump,
     Condition,
@@ -41,6 +42,7 @@ pub struct Record {
     pub aux: u32,
     pub immediate: u64,
     pub target: Option<u64>,
+    pub extra: u64,
 }
 
 impl std::fmt::Display for Record {
@@ -73,6 +75,14 @@ impl std::fmt::Display for Record {
             ),
             Kind::Return => f.write_str("exit -> ret x30"),
             Kind::Nop => f.write_str("nop"),
+            Kind::MovePair => write!(
+                f,
+                "mov2.{width} v{}, {:#x}; v{}, {:#x}",
+                self.dst,
+                self.immediate,
+                self.aux >> 16,
+                self.extra
+            ),
             Kind::Address => write!(f, "addr v{}, bytecode_base + {:#x}", self.dst, self.immediate),
             Kind::Call => write!(f, "call native site #{}", self.immediate),
             Kind::Load | Kind::Store => write!(
@@ -120,6 +130,7 @@ impl Record {
             aux: 0,
             immediate: 0,
             target: None,
+            extra: 0,
         }
     }
 }
@@ -128,4 +139,5 @@ pub struct Program {
     pub records: Vec<Record>,
     pub sources: Vec<Insn>,
     pub entry_patch: u64,
+    pub elided: Vec<u64>,
 }
