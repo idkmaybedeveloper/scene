@@ -1,5 +1,6 @@
 mod pointers;
 mod references;
+pub mod x86;
 
 use std::{collections::BTreeMap, ops::Range};
 

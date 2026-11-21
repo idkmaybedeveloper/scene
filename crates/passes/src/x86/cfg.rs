@@ -10,6 +10,7 @@ pub struct Function<'a> {
     pub insns: &'a [Instruction],
     pub blocks: Vec<Block>,
     pub entry_patch: u64,
+    pub tables: BTreeMap<u64, Vec<u64>>,
 }
 
 pub struct Block {
@@ -23,6 +24,7 @@ pub enum Exit {
     Tail(u64),
     Jump(usize),
     Call { site: u64, next: Option<usize>, resume: u64 },
+    Indirect { insn: Instruction, targets: Vec<(u64, usize)> },
     Conditional { insn: Instruction, taken: Destination, fallthrough: usize },
 }
 
@@ -32,7 +34,7 @@ pub enum Destination {
 }
 
 impl<'a> Function<'a> {
-    pub fn parse(insns: &'a [Instruction]) -> Result<Self> {
+    pub fn parse(insns: &'a [Instruction], tables: &BTreeMap<u64, Vec<u64>>) -> Result<Self> {
         ensure!(!insns.is_empty(), "empty function");
         let start = insns[0].ip();
         let end = insns.last().unwrap().next_ip();
@@ -100,7 +102,17 @@ impl<'a> Function<'a> {
                     }
                 }
                 FlowControl::Return | FlowControl::Exception => {}
-                FlowControl::IndirectBranch => bail!("indirect branches are unsupported"),
+                FlowControl::IndirectBranch => {
+                    let destinations = tables
+                        .get(&insn.ip())
+                        .ok_or_else(|| anyhow::anyhow!("unresolved indirect branch"))?;
+                    for &address in destinations {
+                        let next = target(address)?
+                            .ok_or_else(|| anyhow::anyhow!("jump table leaves function"))?;
+                        leaders.insert(next);
+                        pending.push(next);
+                    }
+                }
                 _ => bail!("unsupported control/system instruction"),
             }
         }
@@ -153,6 +165,13 @@ impl<'a> Function<'a> {
                     next: if last_index + 1 == insns.len() { None } else { Some(next()?) },
                     resume: last.next_ip(),
                 },
+                FlowControl::IndirectBranch => Exit::Indirect {
+                    insn: last,
+                    targets: tables[&last.ip()]
+                        .iter()
+                        .map(|&address| (address, block_at(address)))
+                        .collect(),
+                },
                 FlowControl::Next => {
                     body.end += 1;
                     if last_index + 1 == insns.len() {
@@ -169,6 +188,6 @@ impl<'a> Function<'a> {
         }
         let entry_patch =
             if insns[0].mnemonic() == Mnemonic::Endbr64 { insns[0].next_ip() } else { start };
-        Ok(Self { insns, blocks, entry_patch })
+        Ok(Self { insns, blocks, entry_patch, tables: tables.clone() })
     }
 }

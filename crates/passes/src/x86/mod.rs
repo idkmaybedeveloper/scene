@@ -2,6 +2,9 @@ mod cff;
 mod cfg;
 mod emit;
 mod mba;
+pub mod strings;
+pub mod unwind;
+pub use emit::Encoded as GeneratedCode;
 
 use std::collections::BTreeMap;
 
@@ -27,10 +30,20 @@ pub struct Output {
     pub entry_patch: u64,
     pub resumes: BTreeMap<u64, u64>,
     pub moved: BTreeMap<u64, u64>,
+    pub unwind: Vec<(u64, unwind::Row)>,
 }
 
 pub fn transform(insns: &[Instruction], base: u64, options: Options) -> Result<Output> {
-    cff::transform(&cfg::Function::parse(insns)?, base, options)
+    transform_with_tables(insns, base, options, &BTreeMap::new())
+}
+
+pub fn transform_with_tables(
+    insns: &[Instruction],
+    base: u64,
+    options: Options,
+    tables: &BTreeMap<u64, Vec<u64>>,
+) -> Result<Output> {
+    cff::transform(&cfg::Function::parse(insns, tables)?, base, options)
 }
 
 pub fn substitute(insns: &[Instruction], base: u64) -> Result<Option<Vec<u8>>> {

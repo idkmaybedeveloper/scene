@@ -5,10 +5,12 @@ use apple_codesign::{MachOSigner, SettingsScope, SigningSettings};
 use object::{Endianness, macho, read::macho::LoadCommandVariant};
 
 pub mod functions;
+pub mod jump_tables;
 pub mod layout;
 mod metadata;
 mod sections;
 pub mod strings;
+pub mod unwind;
 
 pub fn data_in_code(file: &object::File) -> Result<Vec<Range<u64>>> {
     let object::File::MachO64(macho) = file else { return Ok(Vec::new()) };

@@ -1,19 +1,26 @@
-use std::{collections::BTreeSet, ops::Range};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
 
 use anyhow::{Context, Result, ensure};
 use iced_x86::{FlowControl, Instruction, OpKind};
-use object::{Object, ObjectSection, ObjectSymbol, SectionKind};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SectionKind};
 use scene_disasm::{Listing, x86::Insn};
+use scene_passes::x86::unwind as frames;
 use scene_passes::x86::{Options, Output};
 
 use super::report::Report;
-use crate::macho::{self, functions, layout::CodeLayout};
+use crate::macho::{self, functions, layout::CodeLayout, strings::x86::Strings, unwind::Unwind};
 
 pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
+    ensure!(
+        !file.segments().any(|s| s.name().ok().flatten() == Some("__SCENE")),
+        "binary already contains scene"
+    );
     let section = file.section_by_name("__text").context("missing __text section")?;
     let (offset, size) = section.file_range().context("__text has no file data")?;
     let base = section.address();
-    let layout = CodeLayout::new(file, data, 0)?;
     let dice = macho::data_in_code(file)?;
     let mut targets = BTreeSet::new();
     let mut insns = Vec::new();
@@ -63,6 +70,37 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
             insns = decoded;
         }
     }
+    let mut source_rows = BTreeMap::new();
+    let mut source_after = BTreeMap::new();
+    let mut tables = BTreeMap::new();
+    for pair in starts.windows(2) {
+        let first = insns.partition_point(|i| i.address() < pair[0]);
+        let end = insns.partition_point(|i| i.address() < pair[1]);
+        if let Some(decoded) = decode_function(&insns[first..end], &(pair[0]..pair[1])) {
+            if let Ok(known) = macho::jump_tables::collect(file, &decoded) {
+                if let Ok(frames) = frames::analyze(&decoded, &known) {
+                    source_rows.extend(frames.rows);
+                    source_after.extend(frames.after);
+                }
+                targets.extend(known.values().flatten().copied());
+                tables.extend(known);
+            }
+        }
+    }
+    let strings = Strings::collect(file, &insns, &targets, &source_rows)?;
+    let mut unwind = Unwind::new(file)?;
+    unwind.reserve(strings.unwind_budget(), strings.code_budget())?;
+    let layout = CodeLayout::with_metadata(
+        file,
+        data,
+        strings.storage_size(),
+        unwind.header_size(),
+        unwind.code_limit(),
+    )?;
+    if layout.in_text_padding() {
+        unwind.share_code(layout.base);
+    }
+    let mut moved = BTreeMap::new();
     let mut out = data.to_vec();
     let mut code = Vec::new();
     let mut entries = Vec::new();
@@ -85,9 +123,11 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
                 seed: Options::default().seed ^ range.start as u32,
                 ..Options::default()
             };
-            let output = scene_passes::x86::transform(&decoded, destination, options)?;
+            let output =
+                scene_passes::x86::transform_with_tables(&decoded, destination, options, &tables)?;
             ensure!(layout.fits(code.len() + output.code.len()), "executable padding exhausted");
             let bridges = bridges(&decoded, &output, destination, &targets)?;
+            unwind.add(destination, output.code.len(), &output.unwind)?;
             Ok((output, bridges))
         })();
         match converted {
@@ -110,6 +150,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
                 report.substitutions += output.substitutions;
                 entries.push(destination);
                 entries.extend(output.resumes.values().copied());
+                moved.extend(output.moved);
                 code.extend(output.code);
                 continue;
             }
@@ -133,6 +174,8 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
                 };
                 ensure!(layout.fits(code.len() + bytes.len()), "executable padding exhausted");
                 let bridge = scene_asm::x86::jump(insn.ip(), destination)?;
+                let row = source_rows.get(&insn.ip()).context("missing source unwind row")?;
+                unwind.add(destination, bytes.len(), &[(destination, row.clone())])?;
                 Ok(Some((bytes, bridge)))
             })();
             match converted {
@@ -168,9 +211,21 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
             report.skip("no eligible arithmetic");
         }
     }
+    unwind.release();
+    strings.apply(
+        file,
+        &mut out,
+        &mut code,
+        &layout,
+        &moved,
+        &mut entries,
+        &mut unwind,
+        &source_rows,
+        &source_after,
+    )?;
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible x86_64 instructions to transform");
-    layout.finish(&out, code, &entries)
+    layout.finish_with_unwind(&out, code, &entries, Some(unwind.finish()))
 }
 
 struct Bridge {

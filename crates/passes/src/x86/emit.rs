@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::unwind::Row;
 use anyhow::{Context, Result, ensure};
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Instruction, InstructionBlock, MemoryOperand, Register,
@@ -15,11 +16,14 @@ pub struct Emitter {
     references: Vec<(usize, Label)>,
     vectors: BTreeMap<[u8; 16], Label>,
     moved: BTreeMap<u64, Label>,
+    unwind: Vec<(Label, Row)>,
+    row: Option<Row>,
 }
 
 pub struct Encoded {
     pub code: Vec<u8>,
     pub moved: BTreeMap<u64, u64>,
+    pub unwind: Vec<(u64, Row)>,
     base: u64,
     labels: Vec<usize>,
     offsets: Vec<u32>,
@@ -42,6 +46,8 @@ impl Emitter {
             references: Vec::new(),
             vectors: BTreeMap::new(),
             moved: BTreeMap::new(),
+            unwind: Vec::new(),
+            row: None,
         }
     }
 
@@ -58,6 +64,16 @@ impl Emitter {
 
     pub fn push(&mut self, insn: Instruction) {
         self.insns.push(insn);
+    }
+
+    pub fn unwind(&mut self, row: Row) {
+        if self.row.as_ref() == Some(&row) {
+            return;
+        }
+        self.row = Some(row.clone());
+        let label = self.label();
+        self.bind(label);
+        self.unwind.push((label, row));
     }
 
     pub fn record(&mut self, address: u64) {
@@ -129,12 +145,16 @@ impl Emitter {
         let mut result = Encoded {
             code: encoded.code_buffer,
             moved: BTreeMap::new(),
+            unwind: Vec::new(),
             base,
             labels,
             offsets: encoded.new_instruction_offsets,
         };
         for (address, label) in self.moved {
             result.moved.insert(address, result.address(label)?);
+        }
+        for (label, row) in self.unwind {
+            result.unwind.push((result.address(label)?, row));
         }
         Ok(result)
     }

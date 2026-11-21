@@ -19,7 +19,7 @@ pub fn substitute(insn: &Instruction, flags_dead: bool) -> Result<Option<Vec<Ins
     }
     let register = insn.op0_register();
     if !register.is_gpr32() && !register.is_gpr64()
-        || matches!(register, Register::ESP | Register::RSP)
+        || matches!(register, Register::ESP | Register::RSP | Register::EBP | Register::RBP)
     {
         return Ok(None);
     }

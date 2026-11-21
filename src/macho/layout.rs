@@ -20,12 +20,22 @@ pub struct CodeLayout {
     text_base: u64,
     placement: Placement,
     merge_sections: bool,
-    storage_size: u64,
+    pub storage_size: u64,
     page_size: u64,
 }
 
 impl CodeLayout {
     pub fn new(file: &object::File, data: &[u8], storage_size: usize) -> Result<Self> {
+        Self::with_metadata(file, data, storage_size, 0, None)
+    }
+
+    pub fn with_metadata(
+        file: &object::File,
+        data: &[u8],
+        storage_size: usize,
+        header_space: usize,
+        code_limit: Option<u64>,
+    ) -> Result<Self> {
         let object::File::MachO64(image) = file else { anyhow::bail!("expected a 64-bit image") };
         ensure!(image.endian() == Endianness::Little, "unsupported byte order");
         let endian = image.endian();
@@ -73,9 +83,16 @@ impl CodeLayout {
             .context("missing section data")?;
         let saved = sections::header_savings(file);
         let storage_size = (storage_size as u64 + page_size - 1) & !(page_size - 1);
-        let extra = if storage_size != 0 { 72 } else { 0 };
-        let required_end =
-            commands_end.checked_add(152 + extra).context("load command size overflow")? - saved;
+        let extend_storage = file.segments().any(|s| {
+            s.address() + s.size() == linkedit.address()
+                && (s.name().ok().flatten() != Some("__DATA_CONST") || file.architecture() == Architecture::X86_64)
+                && matches!(s.flags(), object::SegmentFlags::MachO { initprot, .. } if initprot & macho::VM_PROT_WRITE != macho::VmProt(0))
+        });
+        let extra = if storage_size != 0 && !extend_storage { 72 } else { 0 };
+        let required_end = commands_end
+            .checked_add(152 + extra + 16 + header_space)
+            .context("load command size overflow")?
+            - saved;
         if required_end <= first_section
             && data.get(commands_end..first_section).is_some_and(|b| b.iter().all(|&b| b == 0))
         {
@@ -90,7 +107,7 @@ impl CodeLayout {
             });
         }
         ensure!(
-            commands_end + extra <= first_section + saved,
+            commands_end + extra + 16 + header_space <= first_section + saved,
             "no space for writable string storage"
         );
         let (text_offset, text_size) = text.file_range();
@@ -102,8 +119,11 @@ impl CodeLayout {
             .max()
             .context("missing __text sections")?;
         let offset = last_section.checked_add(3).context("padding offset overflow")? & !3;
-        let end =
+        let mut end =
             text_offset.checked_add(text_size.min(text.size())).context("text size overflow")?;
+        if let Some(limit) = code_limit {
+            end = end.min(limit);
+        }
         ensure!(offset < end, "no space for generated code");
         let padding =
             data.get(offset as usize..end as usize).context("invalid __text file range")?;
@@ -127,7 +147,21 @@ impl CodeLayout {
         }
     }
 
+    pub fn in_text_padding(&self) -> bool {
+        matches!(self.placement, Placement::Padding { .. })
+    }
+
     pub fn finish(self, data: &[u8], code: Vec<u8>, entries: &[u64]) -> Result<Vec<u8>> {
+        self.finish_with_unwind(data, code, entries, None)
+    }
+
+    pub fn finish_with_unwind(
+        self,
+        data: &[u8],
+        code: Vec<u8>,
+        entries: &[u64],
+        unwind: Option<super::unwind::Section>,
+    ) -> Result<Vec<u8>> {
         let original = object::File::parse(data)?;
         let mut builder = Builder::read(data).context("reading image for rebuild")?;
         if self.merge_sections {
@@ -135,6 +169,34 @@ impl CodeLayout {
         }
         if self.storage_size != 0 {
             add_storage(&mut builder, self.data_base, self.storage_size)?;
+        }
+        if let Some(unwind) = &unwind {
+            let text_id = builder
+                .segments
+                .iter()
+                .find(|s| s.segname() == b"__TEXT")
+                .context("missing text segment")?
+                .id();
+            let section_id = if let Some(id) = builder
+                .sections
+                .iter()
+                .find(|s| s.sectname() == b"__eh_frame" && s.segname() == b"__TEXT")
+                .map(|s| s.id())
+            {
+                id
+            } else {
+                let section = builder.sections.add();
+                section.sectname[..10].copy_from_slice(b"__eh_frame");
+                section.segname[..6].copy_from_slice(b"__TEXT");
+                section.addr = unwind.address;
+                section.align = 3;
+                let id = section.id();
+                builder.segments.get_mut(text_id).sections.push(id);
+                id
+            };
+            let section = builder.sections.get_mut(section_id);
+            ensure!(section.addr == unwind.address, "unwind section moved");
+            section.data = SectionData::Data(unwind.data.clone().into());
         }
         for command in &builder.commands {
             if let LoadCommand::Other { cmd, .. } = command {
@@ -187,6 +249,9 @@ impl CodeLayout {
                 })
                 .context("rebuild lost an existing section")?;
             let delta = section.address() - replacement.address();
+            if unwind.is_some() && name == "__eh_frame" {
+                continue;
+            }
             ensure!(
                 replacement.file_range().map(|(o, _)| o + delta)
                     == section.file_range().map(|(o, _)| o),
@@ -270,6 +335,21 @@ fn add_storage(builder: &mut Builder<'_>, base: u64, size: u64) -> Result<()> {
         .find(|s| s.segname() == b"__LINKEDIT")
         .context("missing linkedit")?
         .id();
+    if let Some(writable) = builder
+        .segments
+        .iter()
+        .find(|s| {
+            s.vmaddr + s.vmsize == base
+                && (s.segname() != b"__DATA_CONST"
+                    || builder.header.cputype == macho::CPU_TYPE_X86_64)
+                && s.initprot & macho::VM_PROT_WRITE != macho::VmProt(0)
+        })
+        .map(|s| s.id())
+    {
+        builder.segments.get_mut(writable).vmsize += size;
+        builder.segments.get_mut(id).vmaddr += size;
+        return Ok(());
+    }
     let segment = builder.segments.get_mut(id);
     let old_size = segment.vmsize;
     segment.segname = [0; 16];
