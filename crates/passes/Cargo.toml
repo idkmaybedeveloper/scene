@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 bad64.workspace = true
+iced-x86.workspace = true
 scene-disasm.workspace = true
 scene-asm.workspace = true
 dynasmrt = "5.1"

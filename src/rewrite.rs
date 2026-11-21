@@ -7,8 +7,12 @@ use scene_disasm::Arch;
 use crate::{macho, passes};
 
 pub fn rewrite(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
-    if file.format() == BinaryFormat::MachO && file.architecture() == Architecture::Aarch64 {
-        return passes::run(file, data, dump);
+    if file.format() == BinaryFormat::MachO {
+        match file.architecture() {
+            Architecture::Aarch64 => return passes::run(file, data, dump),
+            Architecture::X86_64 => return passes::x86::run(file, data, dump),
+            _ => {}
+        }
     }
     let arch = match file.architecture() {
         Architecture::X86_64 => Arch::X64,

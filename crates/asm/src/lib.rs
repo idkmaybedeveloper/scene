@@ -1,8 +1,9 @@
 pub mod arm64;
+pub mod x86;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use iced_x86::Encoder;
-use scene_disasm::{Listing, x86};
+use scene_disasm::{Listing, x86::Insn};
 
 const X86_NOP: &[u8] = &[0x90];
 const ARM64_NOP: &[u8] = &0xD503_201Fu32.to_le_bytes();
@@ -14,13 +15,13 @@ pub fn assemble(listing: &Listing, base: u64, size: usize) -> Result<Vec<u8>> {
             let mut encoder = Encoder::new(*bitness);
             for insn in insns {
                 match insn {
-                    x86::Insn::Decoded(insn) => {
+                    Insn::Decoded(insn) => {
                         encoder
                             .encode(insn, insn.ip())
                             .map_err(|e| anyhow!("{:#x}: {insn}: {e}", insn.ip()))?;
                         image.place(insn.ip(), &encoder.take_buffer())?;
                     }
-                    x86::Insn::Raw { address, bytes } => image.place(*address, bytes)?,
+                    Insn::Raw { address, bytes } => image.place(*address, bytes)?,
                 }
             }
             image.finish()

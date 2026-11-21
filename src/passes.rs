@@ -8,6 +8,7 @@ use scene_passes::arm64::{Options, mba_sites, substitute, transform};
 use crate::macho::{self, functions, layout::CodeLayout, strings::Strings};
 
 mod report;
+pub mod x86;
 use report::Report;
 
 pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {

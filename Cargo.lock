@@ -2758,6 +2758,7 @@ dependencies = [
  "bad64",
  "clap",
  "getrandom 0.2.17",
+ "iced-x86",
  "leb128",
  "object 0.41.0",
  "scene-asm",
@@ -2793,6 +2794,7 @@ dependencies = [
  "ctr",
  "dynasmrt",
  "getrandom 0.2.17",
+ "iced-x86",
  "scene-asm",
  "scene-disasm",
 ]

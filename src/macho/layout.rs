@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use object::{
-    Endianness, Object, ObjectSection, ObjectSegment,
+    Architecture, Endianness, Object, ObjectSection, ObjectSegment,
     build::macho::{Builder, LoadCommand, SectionData},
     macho,
 };
@@ -8,7 +8,6 @@ use object::{
 use super::{functions, metadata, sections};
 
 const SEGMENT: &[u8] = b"__SCENE";
-const PAGE_SIZE: u64 = 0x4000;
 
 enum Placement {
     Segment,
@@ -22,6 +21,7 @@ pub struct CodeLayout {
     placement: Placement,
     merge_sections: bool,
     storage_size: u64,
+    page_size: u64,
 }
 
 impl CodeLayout {
@@ -35,11 +35,17 @@ impl CodeLayout {
                 .contains(&header.filetype.get(endian)),
             "input is not a linked image"
         );
-        ensure!(
-            [macho::CPU_SUBTYPE_ARM64_ALL.0, macho::CPU_SUBTYPE_ARM64E.0]
-                .contains(&(header.cpusubtype.get(endian).0 & 0x00FF_FFFF)),
-            "unsupported arm64 subtype"
-        );
+        let subtype = header.cpusubtype.get(endian).0 & 0x00FF_FFFF;
+        let (page_size, subtypes): (_, &[_]) = match file.architecture() {
+            Architecture::Aarch64 => {
+                (0x4000, &[macho::CPU_SUBTYPE_ARM64_ALL.0, macho::CPU_SUBTYPE_ARM64E.0])
+            }
+            Architecture::X86_64 => {
+                (0x1000, &[macho::CPU_SUBTYPE_X86_64_ALL.0, macho::CPU_SUBTYPE_X86_64_H.0])
+            }
+            other => anyhow::bail!("unsupported Mach-O architecture {other:?}"),
+        };
+        ensure!(subtypes.contains(&subtype), "unsupported CPU subtype {subtype:#x}");
         ensure!(
             !file.segments().any(|s| s.name().ok().flatten() == Some("__SCENE")),
             "binary already contains scene"
@@ -52,7 +58,7 @@ impl CodeLayout {
             .segments()
             .find(|s| s.name().ok().flatten() == Some("__TEXT"))
             .context("missing __text")?;
-        ensure!(linkedit.address().is_multiple_of(PAGE_SIZE), "unaligned linkedit");
+        ensure!(linkedit.address().is_multiple_of(page_size), "unaligned linkedit");
         ensure!(
             file.segments().all(|s| s.address() <= linkedit.address()),
             "linkedit must be last"
@@ -66,7 +72,7 @@ impl CodeLayout {
             .min()
             .context("missing section data")?;
         let saved = sections::header_savings(file);
-        let storage_size = (storage_size as u64 + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let storage_size = (storage_size as u64 + page_size - 1) & !(page_size - 1);
         let extra = if storage_size != 0 { 72 } else { 0 };
         let required_end =
             commands_end.checked_add(152 + extra).context("load command size overflow")? - saved;
@@ -80,6 +86,7 @@ impl CodeLayout {
                 placement: Placement::Segment,
                 merge_sections: saved != 0,
                 storage_size,
+                page_size,
             });
         }
         ensure!(
@@ -109,6 +116,7 @@ impl CodeLayout {
             placement: Placement::Padding { offset: offset as usize, capacity: padding.len() },
             merge_sections: saved != 0,
             storage_size,
+            page_size,
         })
     }
 
@@ -139,7 +147,7 @@ impl CodeLayout {
         let code_end = self.base + code.len() as u64;
         let padding = match self.placement {
             Placement::Segment => {
-                add_segment(&mut builder, self.base, code)?;
+                add_segment(&mut builder, self.base, code, self.page_size)?;
                 None
             }
             Placement::Padding { offset, .. } => Some((offset, code)),
@@ -212,10 +220,10 @@ impl CodeLayout {
     }
 }
 
-fn add_segment(builder: &mut Builder<'_>, base: u64, code: Vec<u8>) -> Result<()> {
+fn add_segment(builder: &mut Builder<'_>, base: u64, code: Vec<u8>, page_size: u64) -> Result<()> {
     let mapped_size =
-        (code.len() as u64).checked_add(PAGE_SIZE - 1).context("code size overflow")?
-            & !(PAGE_SIZE - 1);
+        (code.len() as u64).checked_add(page_size - 1).context("code size overflow")?
+            & !(page_size - 1);
     let linkedit_id = builder
         .segments
         .iter()
