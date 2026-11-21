@@ -96,7 +96,7 @@ impl<'a> Function<'a> {
                             || !internal(insn.near_branch_target()),
                         "call to function interior"
                     );
-                    if i + 1 < insns.len() {
+                    if i + 1 < insns.len() && insns[i + 1].mnemonic() != Mnemonic::Ud2 {
                         pending.push(i + 1);
                         leaders.insert(i + 1);
                     }
@@ -162,7 +162,13 @@ impl<'a> Function<'a> {
                 },
                 FlowControl::Call | FlowControl::IndirectCall => Exit::Call {
                     site: last.ip(),
-                    next: if last_index + 1 == insns.len() { None } else { Some(next()?) },
+                    next: if last_index + 1 == insns.len()
+                        || insns[last_index + 1].mnemonic() == Mnemonic::Ud2
+                    {
+                        None
+                    } else {
+                        Some(next()?)
+                    },
                     resume: last.next_ip(),
                 },
                 FlowControl::IndirectBranch => Exit::Indirect {

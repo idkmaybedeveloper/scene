@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use apple_codesign::{MachOSigner, SettingsScope, SigningSettings};
 use object::{Endianness, macho, read::macho::LoadCommandVariant};
 
+pub mod exceptions;
 pub mod functions;
 pub mod jump_tables;
 pub mod layout;

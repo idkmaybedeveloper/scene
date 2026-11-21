@@ -129,6 +129,10 @@ impl Frame {
         };
         match insn.mnemonic() {
             Mnemonic::Push | Mnemonic::Pushfq => {
+                ensure!(
+                    insn.stack_pointer_increment() == -8,
+                    "non-64-bit stack push is unsupported"
+                );
                 self.sp = self.sp.map(|s| s - 8);
                 if NONVOLATILE.contains(&register) {
                     let offset =
@@ -138,6 +142,7 @@ impl Frame {
                 return Ok(());
             }
             Mnemonic::Pop | Mnemonic::Popfq => {
+                ensure!(insn.stack_pointer_increment() == 8, "non-64-bit stack pop is unsupported");
                 ensure!(register != Register::RSP, "unwind pop rsp is unsupported");
                 self.pop(register)?;
                 return Ok(());

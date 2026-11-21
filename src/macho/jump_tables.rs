@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
-use iced_x86::{Instruction, Mnemonic, OpKind};
+use iced_x86::{
+    FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register,
+};
 use object::{Object, ObjectSection};
 
 pub fn collect(file: &object::File, insns: &[Instruction]) -> Result<BTreeMap<u64, Vec<u64>>> {
     let mut tables = BTreeMap::new();
+    let mut factory = InstructionInfoFactory::new();
     for (index, jump) in insns.iter().enumerate() {
         if !jump.is_jmp_near_indirect() || jump.op0_kind() != OpKind::Register || index < 3 {
             continue;
@@ -21,19 +24,24 @@ pub fn collect(file: &object::File, insns: &[Instruction]) -> Result<BTreeMap<u6
             || load.op0_register() != register
             || load.op1_kind() != OpKind::Memory
             || load.memory_base() != add.op1_register()
+            || load.memory_base() == register
             || load.memory_index_scale() != 4
             || load.memory_displacement64() != 0
         {
             continue;
         }
-        let Some(base) = insns[..index - 2]
-            .iter()
-            .rev()
-            .find(|s| s.op0_kind() == OpKind::Register && s.op0_register() == load.memory_base())
-        else {
+        let Some(base_index) = insns[..index - 2].iter().rposition(|s| {
+            s.op0_kind() == OpKind::Register && s.op0_register() == load.memory_base()
+        }) else {
             continue;
         };
+        let base = &insns[base_index];
         if base.mnemonic() != Mnemonic::Lea || !base.is_ip_rel_memory_operand() {
+            continue;
+        }
+        if insns[base_index + 1..index - 2].iter().any(|s| {
+            s.flow_control() != FlowControl::Next || writes(&mut factory, s, load.memory_base())
+        }) {
             continue;
         }
         let mut selector = load.memory_index().full_register();
@@ -46,6 +54,7 @@ pub fn collect(file: &object::File, insns: &[Instruction]) -> Result<BTreeMap<u6
                 && insn.op1_kind() == OpKind::Register
             {
                 selector = insn.op1_register().full_register();
+                continue;
             }
             if insn.mnemonic() == Mnemonic::Ja && at != 0 {
                 let compare = &insns[at - 1];
@@ -57,6 +66,9 @@ pub fn collect(file: &object::File, insns: &[Instruction]) -> Result<BTreeMap<u6
                     count =
                         usize::try_from(compare.immediate(1)).ok().and_then(|n| n.checked_add(1));
                 }
+                break;
+            }
+            if insn.flow_control() != FlowControl::Next || writes(&mut factory, insn, selector) {
                 break;
             }
         }
@@ -89,4 +101,17 @@ pub fn collect(file: &object::File, insns: &[Instruction]) -> Result<BTreeMap<u6
         tables.insert(jump.ip(), targets);
     }
     Ok(tables)
+}
+
+fn writes(factory: &mut InstructionInfoFactory, insn: &Instruction, register: Register) -> bool {
+    factory.info(insn).used_registers().iter().any(|r| {
+        r.register().full_register() == register.full_register()
+            && matches!(
+                r.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            )
+    })
 }

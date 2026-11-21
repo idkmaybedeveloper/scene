@@ -73,12 +73,11 @@ pub fn collect(
                 values[dst] = values[(word >> 16 & 31) as usize];
                 continue;
             }
-            if word & 0x3B00_0000 == 0x1800_0000 {
-                if let Some(address) = target(word, insn.address)
-                    && strings.contains(&address)
-                {
-                    protected.push(address..address + 16);
-                }
+            if word & 0x3B00_0000 == 0x1800_0000
+                && let Some(address) = target(word, insn.address)
+                && strings.contains(&address)
+            {
+                protected.push(address..address + 16);
             }
             let call = matches!(
                 decoded.op(),

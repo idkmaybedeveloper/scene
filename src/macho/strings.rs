@@ -27,6 +27,17 @@ pub struct Strings {
     kept: usize,
 }
 
+pub struct Rewrite<'a, 'data> {
+    pub file: &'a object::File<'data>,
+    pub out: &'a mut [u8],
+    pub code: &'a mut Vec<u8>,
+    pub layout: &'a CodeLayout,
+    pub moved: &'a BTreeMap<u64, u64>,
+    pub insns: &'a [Insn],
+    pub functions: &'a [Function],
+    pub entries: &'a mut Vec<u64>,
+}
+
 impl Strings {
     pub fn collect(file: &object::File, insns: &[Insn], functions: &[Function]) -> Result<Self> {
         let Some(section) = file.sections().find(|s| {
@@ -83,17 +94,8 @@ impl Strings {
             .then(|| layout.data_base + 16 + target - self.section.start)
     }
 
-    pub fn apply(
-        self,
-        file: &object::File,
-        out: &mut [u8],
-        code: &mut Vec<u8>,
-        layout: &CodeLayout,
-        moved: &BTreeMap<u64, u64>,
-        insns: &[Insn],
-        functions: &[Function],
-        entries: &mut Vec<u64>,
-    ) -> Result<()> {
+    pub fn apply(self, rewrite: Rewrite<'_, '_>) -> Result<()> {
+        let Rewrite { file, out, code, layout, moved, insns, functions, entries } = rewrite;
         if self.values.is_empty() {
             eprintln!("strings: 0 encrypted, {} kept", self.kept);
             return Ok(());

@@ -11,7 +11,12 @@ use scene_passes::x86::unwind as frames;
 use scene_passes::x86::{Options, Output};
 
 use super::report::Report;
-use crate::macho::{self, functions, layout::CodeLayout, strings::x86::Strings, unwind::Unwind};
+use crate::macho::{
+    self, functions,
+    layout::CodeLayout,
+    strings::x86::{Rewrite as StringRewrite, Strings},
+    unwind::Unwind,
+};
 
 pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
     ensure!(
@@ -31,6 +36,7 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
     starts.dedup();
     targets.extend(starts.iter().copied());
     targets.extend(file.symbols().map(|s| s.address()));
+    targets.extend(macho::exceptions::landing_pads(file)?);
     starts.push(base + size);
     for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
         let Some((offset, size)) = section.file_range() else { continue };
@@ -76,15 +82,15 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
     for pair in starts.windows(2) {
         let first = insns.partition_point(|i| i.address() < pair[0]);
         let end = insns.partition_point(|i| i.address() < pair[1]);
-        if let Some(decoded) = decode_function(&insns[first..end], &(pair[0]..pair[1])) {
-            if let Ok(known) = macho::jump_tables::collect(file, &decoded) {
-                if let Ok(frames) = frames::analyze(&decoded, &known) {
-                    source_rows.extend(frames.rows);
-                    source_after.extend(frames.after);
-                }
-                targets.extend(known.values().flatten().copied());
-                tables.extend(known);
+        if let Some(decoded) = decode_function(&insns[first..end], &(pair[0]..pair[1]))
+            && let Ok(known) = macho::jump_tables::collect(file, &decoded)
+        {
+            if let Ok(frames) = frames::analyze(&decoded, &known) {
+                source_rows.extend(frames.rows);
+                source_after.extend(frames.after);
             }
+            targets.extend(known.values().flatten().copied());
+            tables.extend(known);
         }
     }
     let strings = Strings::collect(file, &insns, &targets, &source_rows)?;
@@ -212,17 +218,17 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
         }
     }
     unwind.release();
-    strings.apply(
+    strings.apply(StringRewrite {
         file,
-        &mut out,
-        &mut code,
-        &layout,
-        &moved,
-        &mut entries,
-        &mut unwind,
-        &source_rows,
-        &source_after,
-    )?;
+        out: &mut out,
+        code: &mut code,
+        layout: &layout,
+        moved: &moved,
+        entries: &mut entries,
+        unwind: &mut unwind,
+        rows: &source_rows,
+        after: &source_after,
+    })?;
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible x86_64 instructions to transform");
     layout.finish_with_unwind(&out, code, &entries, Some(unwind.finish()))

@@ -86,7 +86,7 @@ impl CodeLayout {
         let extend_storage = file.segments().any(|s| {
             s.address() + s.size() == linkedit.address()
                 && (s.name().ok().flatten() != Some("__DATA_CONST") || file.architecture() == Architecture::X86_64)
-                && matches!(s.flags(), object::SegmentFlags::MachO { initprot, .. } if initprot & macho::VM_PROT_WRITE != macho::VmProt(0))
+                && matches!(s.flags(), object::SegmentFlags::MachO { initprot, flags, .. } if initprot & macho::VM_PROT_WRITE != macho::VmProt(0) && (flags & macho::SG_READ_ONLY == macho::SegmentFlags(0) || file.architecture() == Architecture::X86_64))
         });
         let extra = if storage_size != 0 && !extend_storage { 72 } else { 0 };
         let required_end = commands_end
@@ -343,6 +343,8 @@ fn add_storage(builder: &mut Builder<'_>, base: u64, size: u64) -> Result<()> {
                 && (s.segname() != b"__DATA_CONST"
                     || builder.header.cputype == macho::CPU_TYPE_X86_64)
                 && s.initprot & macho::VM_PROT_WRITE != macho::VmProt(0)
+                && (s.flags & macho::SG_READ_ONLY == macho::SegmentFlags(0)
+                    || builder.header.cputype == macho::CPU_TYPE_X86_64)
         })
         .map(|s| s.id())
     {

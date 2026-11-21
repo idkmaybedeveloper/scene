@@ -16,6 +16,14 @@ const SAVED: &[Register] = &[
     Register::R11,
 ];
 const VECTORS: &[Register] = &[Register::XMM0, Register::XMM1, Register::XMM2];
+const SYS_MPROTECT: u32 = 0x0200_004a;
+
+pub struct Storage {
+    pub state: u64,
+    pub mapped_size: u64,
+    pub source: u64,
+    pub length: usize,
+}
 
 pub fn decoder(
     value: &EncryptedString,
@@ -114,20 +122,21 @@ pub fn decoder(
     out.finish(base)
 }
 
-pub fn initializer(base: u64, state: u64, size: u64, decoders: &[u64]) -> Result<GeneratedCode> {
+pub fn initializer(base: u64, storage: Storage, decoders: &[u64]) -> Result<GeneratedCode> {
+    let state = storage.state;
     let mut out = Emitter::new();
     out.unwind(Row::leaf());
     let retry = out.label();
     let wait = out.label();
     let done = out.label();
     let failed = out.label();
-    out.push(Instruction::with2(Code::Mov_r32_imm32, Register::EAX, 0x0200_004au32)?);
+    out.push(Instruction::with2(Code::Mov_r32_imm32, Register::EAX, SYS_MPROTECT)?);
     out.push(Instruction::with2(
         Code::Lea_r64_m,
         Register::RDI,
         memory(Register::RIP, state as i64),
     )?);
-    out.push(Instruction::with2(Code::Mov_r64_imm64, Register::RSI, size)?);
+    out.push(Instruction::with2(Code::Mov_r64_imm64, Register::RSI, storage.mapped_size)?);
     out.push(Instruction::with2(Code::Mov_r32_imm32, Register::EDX, 3u32)?);
     out.push(Instruction::with(Code::Syscall));
     out.branch(Instruction::with_branch(Code::Jb_rel32_64, 0)?, failed);
@@ -142,6 +151,19 @@ pub fn initializer(base: u64, state: u64, size: u64, decoders: &[u64]) -> Result
     acquire.set_has_lock_prefix(true);
     out.push(acquire);
     out.branch(Instruction::with_branch(Code::Jne_rel32_64, 0)?, wait);
+    out.push(Instruction::with2(
+        Code::Lea_r64_m,
+        Register::RSI,
+        memory(Register::RIP, storage.source as i64),
+    )?);
+    out.push(Instruction::with2(
+        Code::Lea_r64_m,
+        Register::RDI,
+        memory(Register::RIP, state as i64 + 16),
+    )?);
+    out.push(Instruction::with2(Code::Mov_r64_imm64, Register::RCX, storage.length as u64)?);
+    out.push(Instruction::with(Code::Cld));
+    out.push(Instruction::with_rep_movsb(64)?);
     for &decoder in decoders {
         out.push(Instruction::with_branch(Code::Call_rel32_64, decoder)?);
     }

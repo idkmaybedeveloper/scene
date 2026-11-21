@@ -5,7 +5,11 @@ use object::{Object, ObjectSection};
 use scene_disasm::{Listing, arm64::Insn};
 use scene_passes::arm64::{Options, mba_sites, substitute, transform};
 
-use crate::macho::{self, functions, layout::CodeLayout, strings::Strings};
+use crate::macho::{
+    self, functions,
+    layout::CodeLayout,
+    strings::{Rewrite as StringRewrite, Strings},
+};
 
 mod report;
 pub mod x86;
@@ -114,7 +118,16 @@ pub fn run(file: &object::File, data: &[u8], dump: bool) -> Result<Vec<u8>> {
         entries.push(destination);
         report.cff += 1;
     }
-    strings.apply(file, &mut out, &mut code, &layout, &moved, &insns, &functions, &mut entries)?;
+    strings.apply(StringRewrite {
+        file,
+        out: &mut out,
+        code: &mut code,
+        layout: &layout,
+        moved: &moved,
+        insns: &insns,
+        functions: &functions,
+        entries: &mut entries,
+    })?;
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible instructions to transform");
     layout.finish(&out, code, &entries)

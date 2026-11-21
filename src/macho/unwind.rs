@@ -63,6 +63,11 @@ impl Unwind {
         };
         let end = text_offset + text_size.min(text.size());
         ensure!(offset < end, "no text padding for unwind metadata");
+        let padding = text
+            .data()?
+            .get((last - text_offset) as usize..(end - text_offset) as usize)
+            .context("invalid text padding")?;
+        ensure!(padding.iter().all(|&b| b == 0), "text padding contains unsectioned data");
         Ok(Self {
             address: text.address() + offset - text_offset,
             offset,

@@ -58,8 +58,8 @@ pub fn collect(file: &object::File, strings: &Range<u64>) -> Result<Vec<Pointer>
         }
         let Some((offset, _)) = section.file_range() else { continue };
         let bytes = section.data()?;
-        for (index, chunk) in bytes.chunks_exact(8).enumerate() {
-            let target = u64::from_le_bytes(chunk.try_into()?);
+        for (index, chunk) in bytes.as_chunks::<8>().0.iter().enumerate() {
+            let target = u64::from_le_bytes(*chunk);
             if strings.contains(&target) {
                 let address = section.address() + index as u64 * 8;
                 let offset = offset as usize + index * 8;

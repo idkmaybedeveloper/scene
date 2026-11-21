@@ -1851,6 +1851,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "macho-unwind-info"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb4bdc8b0ce69932332cf76d24af69c3a155242af95c226b2ab6c2e371ed1149"
+dependencies = [
+ "thiserror 2.0.21",
+ "zerocopy",
+ "zerocopy-derive",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2773,6 +2784,7 @@ dependencies = [
  "gimli",
  "iced-x86",
  "leb128",
+ "macho-unwind-info",
  "object 0.41.0",
  "scene-asm",
  "scene-disasm",
