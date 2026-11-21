@@ -47,6 +47,7 @@ fn scratch(exclude: [u8; 3]) -> (u8, u8) {
     (free.next().unwrap(), free.next().unwrap())
 }
 
+#[allow(clippy::useless_conversion)]
 fn expand(out: &mut Emitter, op: Op, wide: bool, dst: u8, lhs: u8, rhs: u8, depth: u32) {
     if depth == 0 {
         real(out, op, wide, dst, lhs, rhs);
