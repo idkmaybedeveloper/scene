@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use anyhow::Result;
-use iced_x86::{Code, Instruction, Register};
+use iced_x86::{Code, FlowControl, Instruction, Register};
 use rand::{
     Rng, SeedableRng,
     rngs::StdRng,
@@ -107,7 +107,7 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
                 false,
             );
         }
-        if record.opcode.kind == Kind::Call {
+        if matches!(record.opcode.kind, Kind::Call | Kind::TailJump) {
             encode_operand(
                 &mut bytes[16..32],
                 Operand::Immediate(record.source.ip()),
@@ -175,7 +175,7 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
     }
     let mut calls = BTreeMap::new();
     for record in &program.records {
-        if record.opcode.kind == Kind::Call {
+        if matches!(record.opcode.kind, Kind::Call | Kind::TailJump) {
             calls.insert(record.source.ip(), (record.source, out.label()));
         }
     }
@@ -198,12 +198,21 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         out.bind(*resume);
         context.restore(&mut out, &program.frames.rows[&address])?;
         out.push(*instruction);
+        // a tail jump never returns; a no-return call has nothing following it. either way there is
+        // no continuation to re-enter, so trap behind the transfer (unreachable in practice)
         let next = instruction.next_ip();
+        let resume_offset = (instruction.flow_control() != FlowControl::UnconditionalBranch)
+            .then(|| offsets.get(&next).copied())
+            .flatten();
+        let Some(offset) = resume_offset else {
+            out.push(Instruction::with(Code::Ud2));
+            continue;
+        };
         context.enter(&mut out, &program.frames.rows[&next])?;
         bind(&mut out, &anchors)?;
         lea(&mut out, Register::RAX, bytecode)?;
         store(&mut out, Register::RSP, BASE, Register::RAX)?;
-        constant(&mut out, Register::RDX, offsets[&next] as u64)?;
+        constant(&mut out, Register::RDX, offset as u64)?;
         out.push(Instruction::with2(Code::Add_rm64_r64, Register::RAX, Register::RDX)?);
         store(&mut out, Register::RSP, PC, Register::RAX)?;
         out.jump(dispatch)?;
@@ -722,7 +731,9 @@ fn handler_body(
             out.bind(taken);
             jump_guest(out, dispatch)?;
         }
-        Kind::Call => {
+        // a call and a tail jump both dispatch on the site address to their per-site stub, which
+        // restores the frame and runs the real call or jump
+        Kind::Call | Kind::TailJump => {
             for (&site, (_, label)) in calls {
                 constant(out, RAX, site)?;
                 out.push(Instruction::with2(Code::Cmp_rm64_r64, R8, RAX)?);

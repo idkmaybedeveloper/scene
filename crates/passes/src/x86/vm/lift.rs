@@ -35,6 +35,7 @@ pub enum Kind {
     Leave,
     Call,
     Jump,
+    TailJump,
     Condition,
     Return,
     Nop,
@@ -218,11 +219,8 @@ fn translate(insn: Instruction) -> Result<Record> {
         _ => 8,
     };
     ensure!([1, 2, 4, 8].contains(&width), "vm: unsupported operand width");
-    if matches!(kind, Kind::Imul | Kind::ImulImm | Kind::Cmov) {
+    if matches!(kind, Kind::Imul | Kind::ImulImm | Kind::Cmov | Kind::Lea) {
         ensure!(width != 1, "vm: unsupported operand width for {kind:?}");
-    }
-    if kind == Kind::Lea {
-        ensure!(width == 8, "vm: unsupported lea width");
     }
     let target = matches!(kind, Kind::Jump | Kind::Condition).then(|| insn.near_branch_target());
     Ok(Record {
@@ -247,20 +245,26 @@ pub fn lift(insns: &[Instruction]) -> Result<Program> {
             continue;
         }
         let insn = insns[index];
-        let record = translate(insn)?;
+        let mut record = translate(insn)?;
         if let Some(target) = record.target {
-            pending.push(
-                *indices
-                    .get(&target)
-                    .ok_or_else(|| anyhow::anyhow!("vm: branch leaves function"))?,
-            );
+            match indices.get(&target) {
+                Some(&next) => pending.push(next),
+                None if record.opcode.kind == Kind::Jump => {
+                    record.opcode.kind = Kind::TailJump;
+                    record.target = None;
+                }
+                None => bail!("vm: branch leaves function"),
+            }
         }
-        if !matches!(record.opcode.kind, Kind::Jump | Kind::Return) {
-            ensure!(
-                index + 1 < insns.len() && insn.next_ip() == insns[index + 1].ip(),
-                "vm: function falls past its end"
-            );
-            pending.push(index + 1);
+        if !matches!(record.opcode.kind, Kind::Jump | Kind::TailJump | Kind::Return) {
+            let terminal = record.opcode.kind == Kind::Call && index + 1 >= insns.len();
+            if !terminal {
+                ensure!(
+                    index + 1 < insns.len() && insn.next_ip() == insns[index + 1].ip(),
+                    "vm: function falls past its end"
+                );
+                pending.push(index + 1);
+            }
         }
         records.insert(insn.ip(), record);
     }
