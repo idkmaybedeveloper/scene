@@ -27,23 +27,30 @@ impl Pointer {
 
 pub fn collect(file: &object::File, strings: &Range<u64>) -> Result<Vec<Pointer>> {
     let mut pointers = BTreeMap::new();
-    let exports: Vec<_> = file.exports()?.collect::<object::read::Result<Vec<_>>>()?;
-    let symbols: Vec<_> = file.symbols().filter(|s| s.kind() == SymbolKind::Data).collect();
-    let exposed: Vec<_> = symbols
-        .iter()
-        .filter(|s| exports.iter().any(|e| matches!(e.target(), object::ExportTarget::Address { address } if address == s.address())))
-        .map(|s| {
-            let end = symbols
-                .iter()
-                .filter(|next| {
-                    next.section_index() == s.section_index() && next.address() > s.address()
-                })
-                .map(|s| s.address())
-                .min()
-                .unwrap_or(s.address() + s.size().max(8));
-            s.address()..end
-        })
-        .collect();
+    //NOTE: nlist has no symbol sizes, so an exported symbols' extent is guessed as the gap to
+    //the next symbol. rust drops huge `pub static` tables into __const with no interior symbols
+    let expose_symbols = file.kind() != object::ObjectKind::Executable;
+    let exposed: Vec<_> = if expose_symbols {
+        let exports: Vec<_> = file.exports()?.collect::<object::read::Result<Vec<_>>>()?;
+        let symbols: Vec<_> = file.symbols().filter(|s| s.kind() == SymbolKind::Data).collect();
+        symbols
+            .iter()
+            .filter(|s| exports.iter().any(|e| matches!(e.target(), object::ExportTarget::Address { address } if address == s.address())))
+            .map(|s| {
+                let end = symbols
+                    .iter()
+                    .filter(|next| {
+                        next.section_index() == s.section_index() && next.address() > s.address()
+                    })
+                    .map(|s| s.address())
+                    .min()
+                    .unwrap_or(s.address() + s.size().max(8));
+                s.address()..end
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let protected = |address| {
         exposed.iter().any(|r| r.contains(&address))
             || file.sections().any(|s| {

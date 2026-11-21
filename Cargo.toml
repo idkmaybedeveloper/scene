@@ -10,7 +10,7 @@ edition = "2024"
 anyhow = "1"
 apple-codesign = { version = "0.29", default-features = false }
 clap = { version = "4.6", features = ["derive"] }
-bad64 = "0.13"
+bad64 = "0.13" #TODO: move from bad64 "This crate is dead, use exarmo"
 iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "intel"] }
 object = { version = "0.41", default-features = false, features = ["std", "read", "build"] }
 
