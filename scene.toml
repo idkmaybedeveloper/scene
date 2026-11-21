@@ -2,6 +2,7 @@
 input = "target/release/scene"
 output = "target/release/scene.protected"
 dump = false
+banner = "res/banner.txt"
 
 [passes]
 cff = true
