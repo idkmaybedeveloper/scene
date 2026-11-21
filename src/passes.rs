@@ -13,6 +13,7 @@ use crate::macho::{
 };
 
 mod report;
+mod vm;
 pub mod x86;
 use report::Report;
 
@@ -30,6 +31,9 @@ pub fn run(
     let functions = functions::in_text(file, base, size)?;
     let dice = macho::data_in_code(file)?;
     let insns = decode(section.data()?, base, offset, &dice)?;
+    let mut report = Report::default();
+    let vm_functions =
+        vm::select(file, &insns, &functions, &dice, &passes.vm, passes.seed, &mut report)?;
     let strings = Strings::collect(file, &insns, &functions, passes.strings)?;
     let layout = CodeLayout::new(file, data, strings.storage_size())?;
     let mut moved = std::collections::BTreeMap::new();
@@ -39,13 +43,77 @@ pub fn run(
     let mut out = data.to_vec();
     let mut code = Vec::new();
     let mut entries = Vec::new();
-    let mut report = Report::default();
+    let mut protected = Vec::new();
     let hook = banner_hook(file, &functions, base, offset, size, banner_into);
     let mut main_hook: Option<(u64, u64)> = None;
-    for function in &functions {
+    for (index, function) in functions.iter().enumerate() {
         let candidate = &insns[function.range.clone()];
+        if vm_functions.contains(&index) {
+            let destination = layout.base + code.len() as u64;
+            let converted = (|| -> Result<_> {
+                let start = candidate[0].address;
+                let output = scene_passes::arm64::vm::transform(
+                    candidate,
+                    destination,
+                    passes.seed ^ start as u32,
+                )?;
+                ensure!(
+                    layout.fits(code.len() + output.code.len()),
+                    "executable padding exhausted"
+                );
+                let jump =
+                    scene_asm::arm64::retarget(0x1400_0000, output.entry_patch, destination)?;
+                Ok((output, jump))
+            })();
+            match converted {
+                Ok((output, jump)) => {
+                    let patches = output
+                        .sources
+                        .iter()
+                        .copied()
+                        .filter(|&address| {
+                            address != candidate[0].address || address == output.entry_patch
+                        })
+                        .map(|address| {
+                            (
+                                address,
+                                if address == output.entry_patch { jump } else { 0xd420_0000 },
+                            )
+                        })
+                        .collect();
+                    apply(&mut out, offset, base, patches);
+                    if Some(candidate[0].address) == hook {
+                        main_hook = Some((output.entry_patch, destination));
+                    }
+                    if dump {
+                        log::info!(
+                            "{}: vm at {destination:#x}, {} instructions, {} bytecode bytes, {} total bytes",
+                            function.name,
+                            output.instructions,
+                            output.bytecode.len(),
+                            output.code.len()
+                        );
+                        print!("; vm {} @ {destination:#x}\n{output}", function.name);
+                    }
+                    protected.push(
+                        destination + output.bytecode.start as u64
+                            ..destination + output.bytecode.end as u64,
+                    );
+                    entries.push(destination);
+                    report.vm_instructions += output.instructions;
+                    report.vm_bytecode += output.bytecode.len();
+                    code.extend(output.code);
+                    report.vm += 1;
+                    continue;
+                }
+                Err(error) => {
+                    report.vm_skip(&error);
+                    log::warn!("{}: vm skipped: {error:#}", function.name);
+                }
+            }
+        }
         if !passes.cff.on() && !passes.mba.on() {
-            report.skip("all code passes disabled");
+            report.untouched += 1;
             continue;
         }
         let destination = layout.base + code.len() as u64;
@@ -84,7 +152,7 @@ pub fn run(
                 report.cff_skip(&error);
                 if !passes.mba.on() {
                     if dump {
-                        eprintln!("{}: skipped: {error:#}", function.name);
+                        log::info!("{}: skipped: {error:#}", function.name);
                     }
                     continue;
                 }
@@ -97,13 +165,13 @@ pub fn run(
                         report.substitutions += count;
                         report.mba_only += 1;
                         if dump {
-                            eprintln!("{}: {count} mba, cff skipped: {error:#}", function.name);
+                            log::info!("{}: {count} mba, cff skipped: {error:#}", function.name);
                         }
                     }
                     Ok(_) => {
                         report.skip("no eligible arithmetic");
                         if dump {
-                            eprintln!(
+                            log::info!(
                                 "{}: skipped: {error:#}; no eligible arithmetic",
                                 function.name
                             );
@@ -112,7 +180,7 @@ pub fn run(
                     Err(reason) => {
                         report.skip(reason.root_cause().to_string());
                         if dump {
-                            eprintln!("{}: skipped: {reason:#}", function.name);
+                            log::info!("{}: skipped: {reason:#}", function.name);
                         }
                     }
                 }
@@ -126,7 +194,7 @@ pub fn run(
         }
         let code_size = output.insns.len() * 4;
         if dump {
-            eprintln!(
+            log::info!(
                 "{}: {:#x} -> {destination:#x}, {} -> {code_size} bytes, {} blocks, {} mba",
                 function.name,
                 candidate[0].address,
@@ -154,7 +222,6 @@ pub fn run(
         functions: &functions,
         entries: &mut entries,
     })?;
-    let mut protected = Vec::new();
     if !banner.is_empty() {
         let destination = layout.base + code.len() as u64;
         let main = main_hook.map(|(_, dest)| dest);
@@ -167,9 +234,9 @@ pub fn run(
             Some((entry_patch, _)) => {
                 let shim = scene_asm::arm64::retarget(0x1400_0000, entry_patch, destination)?;
                 apply(&mut out, offset, base, vec![(entry_patch, shim)]);
-                eprintln!("banner: {} lines woven into main at {destination:#x}", banner.len());
+                log::info!("banner: {} lines woven into main at {destination:#x}", banner.len());
             }
-            None => eprintln!("banner: {} lines embedded at {destination:#x}", banner.len()),
+            None => log::info!("banner: {} lines embedded at {destination:#x}", banner.len()),
         }
     }
     report.print(code.len());

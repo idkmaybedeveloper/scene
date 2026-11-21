@@ -130,7 +130,7 @@ impl CodeLayout {
         let padding =
             data.get(offset as usize..end as usize).context("invalid __text file range")?;
         ensure!(padding.iter().all(|&b| b == 0), "unused __text space contains data");
-        eprintln!("using {} bytes of executable __text padding", padding.len());
+        log::info!("using {} bytes of executable __text padding", padding.len());
         Ok(Self {
             base: text.address() + offset - text_offset,
             data_base: linkedit.address(),
@@ -247,6 +247,15 @@ impl CodeLayout {
         builder.write(&mut out).context("rebuildin!")?;
         let rebuilt = object::File::parse(&*out)?;
         for section in original.sections() {
+            if let object::SectionFlags::MachO { flags, .. } = section.flags()
+                && metadata::is_debug_section(
+                    section.segment_name()?.unwrap_or_default().as_bytes(),
+                    section.name_bytes()?,
+                    flags,
+                )
+            {
+                continue;
+            }
             let name = section.name()?;
             let segment = section.segment_name()?;
             let replacement = rebuilt

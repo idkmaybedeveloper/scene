@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use anyhow::{Result, anyhow};
 use object::{
-    build::macho::{Builder, SectionId},
+    build::macho::{Builder, LoadCommand, SectionId},
     macho,
 };
 
@@ -14,6 +14,44 @@ pub fn apply(
     code_end: u64,
     protected: &[Range<u64>],
 ) -> Result<()> {
+    let debug: Vec<_> = builder
+        .sections
+        .iter()
+        .filter(|s| is_debug_section(s.segname(), s.sectname(), s.flags))
+        .map(|s| s.id())
+        .collect();
+    let mut removed = 0;
+    for symbol in &mut builder.symbols {
+        if !symbol.delete
+            && (symbol.n_type.is_stab() || symbol.section.is_some_and(|s| debug.contains(&s)))
+        {
+            symbol.delete = true;
+            removed += 1;
+        }
+    }
+    for section in &mut builder.sections {
+        if debug.contains(&section.id()) {
+            section.delete = true;
+        }
+    }
+    for segment in &mut builder.segments {
+        segment.sections.retain(|s| !debug.contains(s));
+        if segment.segname() == b"__DWARF" && segment.sections.is_empty() {
+            /* object 0.41 uses original segment IDs as indices into the compact
+             * output table, so deleting a segment makes later IDs invalid.
+             * Keep an empty descriptor to preserve those IDs while dropping
+             * all debug payload and its mapping from the rebuilt image.
+             */
+            segment.segname = [0; 16];
+            segment.segname[..12].copy_from_slice(b"__SCENE_META");
+            segment.vmsize = 0;
+            segment.maxprot = macho::VM_PROT_READ;
+            segment.initprot = macho::VM_PROT_READ;
+        }
+    }
+    builder
+        .commands
+        .retain(|c| !matches!(c, LoadCommand::Other { cmd, .. } if *cmd == macho::LC_SYMSEG));
     let executable: Vec<_> = builder
         .sections
         .iter()
@@ -28,7 +66,6 @@ pub fn apply(
             && !symbol.is_extdef()
             && !symbol.n_type.is_stab()
             && symbol.n_type.typ() == macho::N_SECT
-            && executable.iter().any(|(id, _)| symbol.section == Some(*id))
         {
             symbol.name = name()?.into();
             renamed += 1;
@@ -64,8 +101,18 @@ pub fn apply(
             decoys += 1;
         }
     }
-    eprintln!("metadata: {renamed} names changed, {decoys} decoy function entries");
+    log::info!(
+        "metadata: {removed} debug symbols and {} debug sections removed; {renamed} local names replaced, {decoys} decoy function entries",
+        debug.len()
+    );
     Ok(())
+}
+
+pub fn is_debug_section(segment: &[u8], name: &[u8], flags: macho::SectionFlags) -> bool {
+    segment == b"__DWARF"
+        || flags & macho::S_ATTR_DEBUG != macho::SectionFlags(0)
+        || name.starts_with(b"__debug_")
+        || name.starts_with(b"__zdebug_")
 }
 
 fn add_symbol(builder: &mut Builder<'_>, section: SectionId, address: u64) -> Result<()> {

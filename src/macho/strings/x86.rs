@@ -149,7 +149,7 @@ impl Strings {
     pub fn apply(self, rewrite: Rewrite<'_, '_>) -> Result<()> {
         let Rewrite { file, out, code, layout, moved, entries, unwind, rows, after } = rewrite;
         if self.values.is_empty() {
-            eprintln!("strings: 0 encrypted, {} kept", self.kept);
+            log::info!("strings: 0 encrypted, {} kept", self.kept);
             return Ok(());
         }
         let output = |address| layout.data_base + 16 + address - self.start;
@@ -227,7 +227,7 @@ impl Strings {
             out[value.offset..value.offset + value.encrypted.ciphertext.len()]
                 .copy_from_slice(&value.encrypted.ciphertext);
         }
-        eprintln!("strings: {} encrypted, {} kept", self.values.len(), self.kept);
+        log::info!("strings: {} encrypted, {} kept", self.values.len(), self.kept);
         Ok(())
     }
 }

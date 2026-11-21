@@ -113,7 +113,7 @@ impl Strings {
             self.constants.exclude_code_padding(layout.base);
         }
         if self.values.is_empty() && self.constants.values.is_empty() {
-            eprintln!("strings: 0 encrypted, {} kept", self.kept + self.constants.kept);
+            log::info!("strings: 0 encrypted, {} kept", self.kept + self.constants.kept);
             return Ok(());
         }
         let mut decoders = Vec::new();
@@ -193,7 +193,7 @@ impl Strings {
             out[value.offset..value.offset + value.encrypted.ciphertext.len()]
                 .copy_from_slice(&value.encrypted.ciphertext);
         }
-        eprintln!(
+        log::info!(
             "strings: {} encrypted, {} kept (__cstring: {}, __const: {})",
             self.values.len() + self.constants.values.len(),
             self.kept + self.constants.kept,

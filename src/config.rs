@@ -43,9 +43,48 @@ impl<'de> Deserialize<'de> for Level {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Default)]
+pub enum Vm {
+    #[default]
+    Off,
+    Random,
+    Functions(Vec<glob::Pattern>),
+}
+
+impl Vm {
+    pub fn on(&self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Random => true,
+            Self::Functions(patterns) => !patterns.is_empty(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Vm {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Enabled(bool),
+            Functions(Vec<String>),
+        }
+        match Value::deserialize(deserializer)? {
+            Value::Enabled(false) => Ok(Self::Off),
+            Value::Enabled(true) => Ok(Self::Random),
+            Value::Functions(names) => names
+                .into_iter()
+                .map(|name| glob::Pattern::new(&name).map_err(de::Error::custom))
+                .collect::<Result<_, _>>()
+                .map(Self::Functions),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Passes {
+    pub vm: Vm,
     pub cff: Level,
     pub mba: Level,
     pub strings: bool,
@@ -54,7 +93,7 @@ pub struct Passes {
 
 impl Default for Passes {
     fn default() -> Self {
-        Self { cff: Level(1), mba: Level(1), strings: true, seed: DEFAULT_SEED }
+        Self { vm: Vm::Off, cff: Level(1), mba: Level(1), strings: true, seed: DEFAULT_SEED }
     }
 }
 
@@ -103,6 +142,7 @@ dump = false
 # banner_into = \"JNI_OnLoad\"
 
 [passes]
+vm = false      # true: random eligible subset; or [\"function\", \"module::*\"]
 cff = 1         # control-flow flattening: 0 = off, 1 = default, higher = more states
 mba = 1         # mixed boolean-arithmetic: 0 = off, 1 = default, higher = deeper nesting
 strings = true  # string + constant encryption
@@ -115,6 +155,6 @@ pub fn init() -> Result<()> {
         bail!("{} already exists", path.display());
     }
     fs::write(path, TEMPLATE).with_context(|| format!("writing {}", path.display()))?;
-    eprintln!("wrote {}", path.display());
+    log::info!("wrote {}", path.display());
     Ok(())
 }

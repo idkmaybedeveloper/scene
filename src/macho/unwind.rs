@@ -203,7 +203,7 @@ impl Unwind {
             }
         }
         self.data.extend([0; 4]);
-        eprintln!("unwind: {} generated fdes, {} bytes", self.count, self.data.len());
+        log::info!("unwind: {} generated fdes, {} bytes", self.count, self.data.len());
         Section { address, data: self.data }
     }
 }

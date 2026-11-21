@@ -9,3 +9,4 @@ cff = true
 mba = true
 strings = true
 seed = 0x7363656e
+vm = true

@@ -27,6 +27,7 @@ pub fn run(
     banner: &[Vec<u8>],
     banner_into: Option<&str>,
 ) -> Result<Vec<u8>> {
+    ensure!(!passes.vm.on(), "vm is currently supported only for ARM64");
     ensure!(
         !file.segments().any(|s| s.name().ok().flatten() == Some("__SCENE")),
         "binary already contains scene"
@@ -141,7 +142,7 @@ pub fn run(
             continue;
         };
         if !passes.cff.on() && !passes.mba.on() {
-            report.skip("all code passes disabled");
+            report.untouched += 1;
             continue;
         }
         if passes.cff.on() {
@@ -174,7 +175,7 @@ pub fn run(
                         out[at..at + bridge.bytes.len()].copy_from_slice(&bridge.bytes);
                     }
                     if dump {
-                        eprintln!(
+                        log::info!(
                             "{:#x} -> {destination:#x}: {} blocks, {} mba, {} bytes",
                             range.start,
                             output.blocks,
@@ -196,7 +197,7 @@ pub fn run(
                 Err(error) => {
                     report.cff_skip(&error);
                     if dump {
-                        eprintln!("{:#x}: cff skipped: {error:#}", range.start);
+                        log::info!("{:#x}: cff skipped: {error:#}", range.start);
                     }
                 }
             }
@@ -232,7 +233,7 @@ pub fn run(
                     out[at..at + insn.len()].fill(0x90);
                     out[at..at + bridge.len()].copy_from_slice(&bridge);
                     if dump {
-                        eprintln!("{:#x} -> {destination:#x}: {insn}", insn.ip());
+                        log::info!("{:#x} -> {destination:#x}: {insn}", insn.ip());
                         print!(
                             "; mba @ {destination:#x}\n{}",
                             Listing::X86 {
@@ -248,7 +249,7 @@ pub fn run(
                 Ok(None) => {}
                 Err(error) => {
                     if dump {
-                        eprintln!("{:#x}: skipped: {error:#}", insn.ip());
+                        log::info!("{:#x}: skipped: {error:#}", insn.ip());
                     }
                 }
             }
@@ -285,9 +286,9 @@ pub fn run(
                 let at = (offset + entry_patch - base) as usize;
                 let shim = scene_asm::x86::jump(entry_patch, destination)?;
                 out[at..at + shim.len()].copy_from_slice(&shim);
-                eprintln!("banner: {} lines woven into main at {destination:#x}", banner.len());
+                log::info!("banner: {} lines woven into main at {destination:#x}", banner.len());
             }
-            None => eprintln!("banner: {} lines embedded at {destination:#x}", banner.len()),
+            None => log::info!("banner: {} lines embedded at {destination:#x}", banner.len()),
         }
     }
     report.print(code.len());

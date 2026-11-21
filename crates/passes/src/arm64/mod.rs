@@ -5,6 +5,7 @@ mod emit;
 mod mba;
 mod relocate;
 pub mod strings;
+pub mod vm;
 
 use std::collections::{BTreeMap, BTreeSet};
 

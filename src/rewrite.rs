@@ -25,6 +25,7 @@ pub fn rewrite(
             _ => {}
         }
     }
+    ensure!(!passes.vm.on(), "vm requires an arm mach-o binary");
     let arch = match file.architecture() {
         Architecture::X86_64 => Arch::X64,
         Architecture::I386 => Arch::X86,
@@ -57,7 +58,7 @@ pub fn rewrite(
         ensure!(code.len() == range.len());
 
         let changed = code.iter().zip(&data[range.clone()]).filter(|(a, b)| a != b).count();
-        eprintln!(
+        log::info!(
             "{name:<16} {base:#014x} {:>8} insns {:>8} bytes, {changed} changed",
             listing.len(),
             range.len()
