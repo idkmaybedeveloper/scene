@@ -1,3 +1,4 @@
+mod constants;
 mod pointers;
 mod references;
 pub mod x86;
@@ -25,6 +26,7 @@ pub struct Strings {
     references: Vec<Reference>,
     pointers: Vec<Pointer>,
     kept: usize,
+    constants: constants::Constants,
 }
 
 pub struct Rewrite<'a, 'data> {
@@ -40,6 +42,7 @@ pub struct Rewrite<'a, 'data> {
 
 impl Strings {
     pub fn collect(file: &object::File, insns: &[Insn], functions: &[Function]) -> Result<Self> {
+        let constants = constants::Constants::collect(file)?;
         let Some(section) = file.sections().find(|s| {
             s.name().ok() == Some("__cstring") && s.segment_name().ok().flatten() == Some("__TEXT")
         }) else {
@@ -49,6 +52,7 @@ impl Strings {
                 references: Vec::new(),
                 pointers: Vec::new(),
                 kept: 0,
+                constants,
             });
         };
         let range = section.address()..section.address() + section.size();
@@ -76,11 +80,11 @@ impl Strings {
             }
             cursor += value.len();
         }
-        Ok(Self { section: range, values, references, pointers, kept })
+        Ok(Self { section: range, values, references, pointers, kept, constants })
     }
 
     pub fn storage_size(&self) -> usize {
-        if self.values.is_empty() {
+        if self.values.is_empty() && self.constants.values.is_empty() {
             0
         } else {
             (self.section.end - self.section.start) as usize + 16
@@ -94,10 +98,13 @@ impl Strings {
             .then(|| layout.data_base + 16 + target - self.section.start)
     }
 
-    pub fn apply(self, rewrite: Rewrite<'_, '_>) -> Result<()> {
+    pub fn apply(mut self, rewrite: Rewrite<'_, '_>) -> Result<()> {
         let Rewrite { file, out, code, layout, moved, insns, functions, entries } = rewrite;
-        if self.values.is_empty() {
-            eprintln!("strings: 0 encrypted, {} kept", self.kept);
+        if layout.in_text_padding() {
+            self.constants.exclude_code_padding(layout.base);
+        }
+        if self.values.is_empty() && self.constants.values.is_empty() {
+            eprintln!("strings: 0 encrypted, {} kept", self.kept + self.constants.kept);
             return Ok(());
         }
         let mut decoders = Vec::new();
@@ -113,8 +120,24 @@ impl Strings {
             entries.push(base);
             decoders.push(base);
         }
+        for value in &self.constants.values {
+            let base = layout.base + code.len() as u64;
+            code.extend(native::decoder(
+                &value.encrypted,
+                value.range.start,
+                value.range.start,
+                base,
+            )?);
+            entries.push(base);
+            decoders.push(base);
+        }
         let initialize = layout.base + code.len() as u64;
-        code.extend(native::initializer(initialize, layout.data_base, &decoders)?);
+        code.extend(native::initializer(
+            initialize,
+            layout.data_base,
+            &decoders,
+            &self.constants.pages,
+        )?);
         entries.push(initialize);
         for reference in &self.references {
             let Some(output) = self.output(reference.target, layout) else { continue };
@@ -157,11 +180,17 @@ impl Strings {
                 pointer.write(out, output)?;
             }
         }
-        for value in &self.values {
+        for value in self.values.iter().chain(&self.constants.values) {
             out[value.offset..value.offset + value.encrypted.ciphertext.len()]
                 .copy_from_slice(&value.encrypted.ciphertext);
         }
-        eprintln!("strings: {} encrypted, {} kept", self.values.len(), self.kept);
+        eprintln!(
+            "strings: {} encrypted, {} kept (__cstring: {}, __const: {})",
+            self.values.len() + self.constants.values.len(),
+            self.kept + self.constants.kept,
+            self.values.len(),
+            self.constants.values.len()
+        );
         Ok(())
     }
 }

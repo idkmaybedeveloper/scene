@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use anyhow::{Result, ensure};
 use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation, dynasm};
 use scene_disasm::{Listing, arm64::Insn};
@@ -7,6 +9,9 @@ use crate::strings::EncryptedString;
 
 type Assembler = VecAssembler<Aarch64Relocation>;
 const NZCV: u32 = 0x5a10;
+const VM_PROT_READ: u32 = 1;
+const VM_PROT_WRITE: u32 = 2;
+const VM_PROT_COPY: u32 = 0x10;
 
 pub fn decoder(value: &EncryptedString, source: u64, output: u64, base: u64) -> Result<Vec<u8>> {
     let mut asm = Assembler::new(base as usize);
@@ -90,19 +95,30 @@ pub fn decoder(value: &EncryptedString, source: u64, output: u64, base: u64) -> 
     Ok(original)
 }
 
-pub fn initializer(base: u64, state: u64, decoders: &[u64]) -> Result<Vec<u8>> {
+pub fn initializer(
+    base: u64,
+    state: u64,
+    decoders: &[u64],
+    pages: &[Range<u64>],
+) -> Result<Vec<u8>> {
     let mut asm = Assembler::new(base as usize);
     let retry = asm.new_dynamic_label();
     let wait = asm.new_dynamic_label();
     let done = asm.new_dynamic_label();
+    let failed = asm.new_dynamic_label();
     dynasm!(asm
         ; .arch aarch64
-        ; stp x9, x10, [sp, -128]!
-        ; stp x11, x12, [sp, 16]
-        ; stp x13, x14, [sp, 32]
-        ; stp x15, x30, [sp, 48]
-        ; stp q0, q1, [sp, 64]
-        ; stp q2, q3, [sp, 96]
+        ; stp x0, x1, [sp, -208]!
+        ; stp x2, x3, [sp, 16]
+        ; stp x4, x5, [sp, 32]
+        ; stp x6, x7, [sp, 48]
+        ; stp x8, x9, [sp, 64]
+        ; stp x10, x11, [sp, 80]
+        ; stp x12, x13, [sp, 96]
+        ; stp x14, x15, [sp, 112]
+        ; str x30, [sp, 128]
+        ; stp q0, q1, [sp, 144]
+        ; stp q2, q3, [sp, 176]
     );
     address(&mut asm, 16, state);
     dynasm!(asm
@@ -116,8 +132,16 @@ pub fn initializer(base: u64, state: u64, decoders: &[u64]) -> Result<Vec<u8>> {
         ; stxr w17, w15, [x16]
         ; cbnz w17, =>retry
     );
+    for page in pages {
+        protect(&mut asm, page, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        dynasm!(asm; .arch aarch64; cbnz w0, =>failed);
+    }
     for &decoder in decoders {
         dynasm!(asm; .arch aarch64; bl extern decoder as usize);
+    }
+    for page in pages {
+        protect(&mut asm, page, VM_PROT_READ);
+        dynasm!(asm; .arch aarch64; cbnz w0, =>failed);
     }
     address(&mut asm, 16, state);
     dynasm!(asm
@@ -131,15 +155,38 @@ pub fn initializer(base: u64, state: u64, decoders: &[u64]) -> Result<Vec<u8>> {
         ; b =>retry
         ; =>done
         ; clrex
-        ; ldp q2, q3, [sp, 96]
-        ; ldp q0, q1, [sp, 64]
-        ; ldp x15, x30, [sp, 48]
-        ; ldp x13, x14, [sp, 32]
-        ; ldp x11, x12, [sp, 16]
-        ; ldp x9, x10, [sp], 128
+        ; ldp q2, q3, [sp, 176]
+        ; ldp q0, q1, [sp, 144]
+        ; ldr x30, [sp, 128]
+        ; ldp x14, x15, [sp, 112]
+        ; ldp x12, x13, [sp, 96]
+        ; ldp x10, x11, [sp, 80]
+        ; ldp x8, x9, [sp, 64]
+        ; ldp x6, x7, [sp, 48]
+        ; ldp x4, x5, [sp, 32]
+        ; ldp x2, x3, [sp, 16]
+        ; ldp x0, x1, [sp], 208
         ; ret
+        ; =>failed
+        ; brk 0
     );
     Ok(asm.finalize()?)
+}
+
+fn protect(asm: &mut Assembler, pages: &Range<u64>, protection: u32) {
+    //NOTE: Darwin Mach traps: task_self (28), mach_vm_protect (14).
+    // ref: https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/syscall_sw.c
+    // VM_PROT_COPY allows private writes to the read-only constant mapping.
+    // Executable pages must be excluded before requesting write permission.
+    dynasm!(asm; .arch aarch64; movn x16, 27; svc 0x80);
+    address(asm, 1, pages.start);
+    constant(asm, 2, pages.end - pages.start);
+    dynasm!(asm; .arch aarch64
+        ; mov w3, 0
+        ; movz w4, protection
+        ; movn x16, 13
+        ; svc 0x80
+    );
 }
 
 pub fn guard(base: u64, state: u64, initialize: u64, original: &Insn) -> Result<Vec<u8>> {
