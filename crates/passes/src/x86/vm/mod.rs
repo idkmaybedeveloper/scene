@@ -15,6 +15,8 @@ pub struct Options {
     pub mutation_seed: Option<u64>,
     pub anchors: Vec<u64>,
     pub addresses: BTreeMap<u64, u64>,
+    /// emit exact unwind across the pushfq/popfq windows; set when the eh_frame has room
+    pub precise: bool,
 }
 
 impl Default for Options {
@@ -24,6 +26,7 @@ impl Default for Options {
             mutation_seed: None,
             anchors: Vec::new(),
             addresses: BTreeMap::new(),
+            precise: false,
         }
     }
 }

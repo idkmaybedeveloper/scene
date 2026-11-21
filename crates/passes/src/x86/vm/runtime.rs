@@ -44,7 +44,7 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
     slots.shuffle(&mut rng);
     let mut order: Vec<_> = (0..16).collect();
     order.shuffle(&mut rng);
-    let context = Context { slots, order };
+    let context = Context { slots, order, precise: options.precise };
     let mut out = Emitter::new();
     let records = Records::new(program.records.len(), 64, &mut rng);
     let offsets: BTreeMap<_, _> = program
@@ -250,7 +250,11 @@ pub fn emit(program: &Program, base: u64, options: Options) -> Result<Output> {
         binding: Binding {
             anchors,
             keys: key_start..key_start + 352,
-            tables: if table_mode { vec![Range { start: table_start, end: table_start + 2048 }] } else { Vec::new() },
+            tables: if table_mode {
+                vec![Range { start: table_start, end: table_start + 2048 }]
+            } else {
+                Vec::new()
+            },
         },
         instructions: program.records.len(),
         handlers: handlers.len(),
@@ -526,6 +530,39 @@ fn handler_body(
             out.bind(done);
             result(out, context, width, 16, dispatch, move_stack, true)?;
         }
+        Kind::ImulImm => {
+            // dest = src * imm; src is in r9
+            let index = match width {
+                2 => 1,
+                4 => 2,
+                _ => 3,
+            };
+            load(out, RAX, RSP, PLAINTEXT + 56)?;
+            out.push(Instruction::with2(Code::Mov_r64_rm64, R8, R9)?);
+            let code =
+                [Code::INVALID, Code::Imul_r16_rm16, Code::Imul_r32_rm32, Code::Imul_r64_rm64]
+                    [index];
+            out.push(Instruction::with2(code, lhs, sized(RAX, width))?);
+            context::flags(out, true, context.precise)?;
+            result(out, context, width, 16, dispatch, move_stack, true)?;
+        }
+        Kind::Cmov => {
+            let codes = cmov_codes(width);
+            let apply = out.label();
+            for (i, &code) in codes.iter().enumerate() {
+                let next = out.label();
+                read(out, RDX, memory(RSP, PLAINTEXT + condition as i64), 1)?;
+                compare(out, RDX, i as i32 + 1)?;
+                branch(out, Code::Jne_rel32_64, next)?;
+                context::flags(out, false, context.precise)?;
+                out.push(Instruction::with2(code, lhs, rhs)?);
+                out.jump(apply)?;
+                out.bind(next);
+            }
+            out.push(Instruction::with(Code::Ud2));
+            out.bind(apply);
+            result(out, context, width, 16, dispatch, move_stack, true)?;
+        }
         Kind::Add
         | Kind::Sub
         | Kind::And
@@ -543,7 +580,7 @@ fn handler_body(
         | Kind::Sar
         | Kind::Rol
         | Kind::Ror => {
-            context::flags(out, false)?;
+            context::flags(out, false, context.precise)?;
             let index = match width {
                 1 => 0,
                 2 => 1,
@@ -619,7 +656,7 @@ fn handler_body(
             } else {
                 out.push(Instruction::with2(code, lhs, rhs)?);
             }
-            context::flags(out, true)?;
+            context::flags(out, true, context.precise)?;
             if matches!(opcode.kind, Kind::Cmp | Kind::Test) {
                 out.jump(dispatch)?;
             } else {
@@ -676,7 +713,7 @@ fn handler_body(
                 read(out, RDX, memory(RSP, PLAINTEXT + condition as i64), 1)?;
                 compare(out, RDX, i as i32 + 1)?;
                 branch(out, Code::Jne_rel32_64, next)?;
-                context::flags(out, false)?;
+                context::flags(out, false, context.precise)?;
                 branch(out, *code, taken)?;
                 out.jump(dispatch)?;
                 out.bind(next);
@@ -700,6 +737,65 @@ fn handler_body(
         Kind::Nop => out.jump(dispatch)?,
     }
     Ok(())
+}
+
+fn cmov_codes(width: usize) -> [Code; 16] {
+    match width {
+        2 => [
+            Code::Cmovo_r16_rm16,
+            Code::Cmovno_r16_rm16,
+            Code::Cmovb_r16_rm16,
+            Code::Cmovae_r16_rm16,
+            Code::Cmove_r16_rm16,
+            Code::Cmovne_r16_rm16,
+            Code::Cmovbe_r16_rm16,
+            Code::Cmova_r16_rm16,
+            Code::Cmovs_r16_rm16,
+            Code::Cmovns_r16_rm16,
+            Code::Cmovp_r16_rm16,
+            Code::Cmovnp_r16_rm16,
+            Code::Cmovl_r16_rm16,
+            Code::Cmovge_r16_rm16,
+            Code::Cmovle_r16_rm16,
+            Code::Cmovg_r16_rm16,
+        ],
+        4 => [
+            Code::Cmovo_r32_rm32,
+            Code::Cmovno_r32_rm32,
+            Code::Cmovb_r32_rm32,
+            Code::Cmovae_r32_rm32,
+            Code::Cmove_r32_rm32,
+            Code::Cmovne_r32_rm32,
+            Code::Cmovbe_r32_rm32,
+            Code::Cmova_r32_rm32,
+            Code::Cmovs_r32_rm32,
+            Code::Cmovns_r32_rm32,
+            Code::Cmovp_r32_rm32,
+            Code::Cmovnp_r32_rm32,
+            Code::Cmovl_r32_rm32,
+            Code::Cmovge_r32_rm32,
+            Code::Cmovle_r32_rm32,
+            Code::Cmovg_r32_rm32,
+        ],
+        _ => [
+            Code::Cmovo_r64_rm64,
+            Code::Cmovno_r64_rm64,
+            Code::Cmovb_r64_rm64,
+            Code::Cmovae_r64_rm64,
+            Code::Cmove_r64_rm64,
+            Code::Cmovne_r64_rm64,
+            Code::Cmovbe_r64_rm64,
+            Code::Cmova_r64_rm64,
+            Code::Cmovs_r64_rm64,
+            Code::Cmovns_r64_rm64,
+            Code::Cmovp_r64_rm64,
+            Code::Cmovnp_r64_rm64,
+            Code::Cmovl_r64_rm64,
+            Code::Cmovge_r64_rm64,
+            Code::Cmovle_r64_rm64,
+            Code::Cmovg_r64_rm64,
+        ],
+    }
 }
 
 fn jump_guest(out: &mut Emitter, dispatch: Label) -> Result<()> {

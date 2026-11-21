@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail, ensure};
-use iced_x86::{Code, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, ConditionCode, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
 use super::super::unwind::{self, Frames};
 
@@ -28,6 +28,8 @@ pub enum Kind {
     Rol,
     Ror,
     Imul,
+    ImulImm,
+    Cmov,
     Push,
     Pop,
     Leave,
@@ -164,6 +166,7 @@ fn translate(insn: Instruction) -> Result<Record> {
         Mnemonic::Rol => Kind::Rol,
         Mnemonic::Ror => Kind::Ror,
         Mnemonic::Imul if insn.op_count() == 2 => Kind::Imul,
+        Mnemonic::Imul if insn.op_count() == 3 => Kind::ImulImm,
         Mnemonic::Push if insn.stack_pointer_increment() == -8 => Kind::Push,
         Mnemonic::Pop
             if insn.stack_pointer_increment() == 8
@@ -182,10 +185,26 @@ fn translate(insn: Instruction) -> Result<Record> {
         Mnemonic::Ret if insn.code() == Code::Retnq => Kind::Return,
         Mnemonic::Nop | Mnemonic::Endbr64 => Kind::Nop,
         _ if insn.is_jcc_short_or_near() => Kind::Condition,
+        // cmovcc is the only conditional with two operands and a register destination
+        _ if insn.condition_code() != ConditionCode::None
+            && insn.op_count() == 2
+            && insn.op0_kind() == OpKind::Register =>
+        {
+            Kind::Cmov
+        }
         _ => bail!("vm: unsupported instruction {insn}"),
     };
     let mut operands = [Operand::None; 2];
-    if !matches!(
+    let mut extra = None;
+    if kind == Kind::ImulImm {
+        // imul dest, src, imm: dest is write-only, the product is src * imm
+        operands[0] = operand(&insn, 0)?;
+        operands[1] = operand(&insn, 1)?;
+        let Operand::Immediate(value) = operand(&insn, 2)? else {
+            bail!("vm: unsupported multiply immediate {insn}")
+        };
+        extra = Some((Operand::None, value));
+    } else if !matches!(
         kind,
         Kind::Call | Kind::Jump | Kind::Condition | Kind::Return | Kind::Leave | Kind::Nop
     ) {
@@ -199,8 +218,8 @@ fn translate(insn: Instruction) -> Result<Record> {
         _ => 8,
     };
     ensure!([1, 2, 4, 8].contains(&width), "vm: unsupported operand width");
-    if kind == Kind::Imul {
-        ensure!(width != 1, "vm: unsupported multiply width");
+    if matches!(kind, Kind::Imul | Kind::ImulImm | Kind::Cmov) {
+        ensure!(width != 1, "vm: unsupported operand width for {kind:?}");
     }
     if kind == Kind::Lea {
         ensure!(width == 8, "vm: unsupported lea width");
@@ -212,7 +231,7 @@ fn translate(insn: Instruction) -> Result<Record> {
         target,
         condition: insn.condition_code() as u8,
         source: insn,
-        extra: None,
+        extra,
     })
 }
 

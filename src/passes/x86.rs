@@ -105,7 +105,6 @@ pub fn run(
     }
     let strings = Strings::collect(file, &insns, &targets, &source_rows, passes.strings)?;
     let mut unwind = Unwind::new(file)?;
-    unwind.reserve(strings.unwind_budget(), strings.code_budget())?;
     let layout = CodeLayout::with_metadata(
         file,
         data,
@@ -114,7 +113,12 @@ pub fn run(
         unwind.code_limit(),
     )?;
     if layout.in_text_padding() {
+        // code and eh_frame share the __text padding; reserve the strings budget up front
+        unwind.reserve(strings.unwind_budget(), strings.code_budget())?;
         unwind.share_code(layout.base);
+    } else {
+        // generated code lives in __SCENE; put the eh_frame there too, free of the padding limit
+        unwind.segment();
     }
     let mut moved = BTreeMap::new();
     let mut out = data.to_vec();
@@ -162,6 +166,8 @@ pub fn run(
                             .range(range.clone())
                             .map(|(&a, &b)| (a, b))
                             .collect(),
+                        // exact pushfq-window unwind is affordable once eh_frame lives in __SCENE
+                        precise: !layout.in_text_padding(),
                         ..Default::default()
                     },
                 )?;
@@ -382,7 +388,11 @@ pub fn run(
     super::vm::seal(&mut code, bindings, &out, offset, base)?;
     report.print(code.len());
     ensure!(!entries.is_empty(), "no eligible x86_64 instructions to transform");
-    layout.finish_with_unwind(&out, code, &entries, Some(unwind.finish()), &protected)
+    // in __SCENE mode the eh_frame trails the code at an 8-aligned address; hand that address to
+    // finish so the pc-relative fdes are relocated to it, and to finish_with_unwind to place it
+    let eh_frame = unwind.is_segmented().then(|| (layout.base + code.len() as u64 + 7) & !7);
+    let unwind = unwind.finish(eh_frame);
+    layout.finish_with_unwind(&out, code, &entries, Some(unwind), &protected)
 }
 
 struct Bridge {

@@ -25,6 +25,7 @@ pub struct Unwind {
     reserved: usize,
     reserved_code: usize,
     shared_code_end: Option<u64>,
+    segmented: bool,
 }
 
 impl Unwind {
@@ -78,6 +79,7 @@ impl Unwind {
             reserved: 0,
             reserved_code: 0,
             shared_code_end: None,
+            segmented: false,
         })
     }
 
@@ -90,6 +92,18 @@ impl Unwind {
 
     pub fn share_code(&mut self, base: u64) {
         self.shared_code_end = Some(base);
+    }
+
+    /// place the generated eh_frame in the __SCENE segment instead of the __text trailing
+    /// padding, lifting the capacity limit; the fdes are relocated to their final address by
+    /// `finish`. only takes effect for a freshly created section: when the binary already ships
+    /// an __eh_frame we keep extending it in place so the original fdes are not disturbed
+    pub fn segment(&mut self) {
+        self.segmented = self.new_section;
+    }
+
+    pub fn is_segmented(&self) -> bool {
+        self.segmented
     }
 
     pub fn reserve(&mut self, bytes: usize, code: usize) -> Result<()> {
@@ -172,7 +186,8 @@ impl Unwind {
             })
             .unwrap_or(0);
         ensure!(
-            self.data.len() + bytes.len() + self.reserved + consumed + 4 <= self.capacity,
+            self.segmented
+                || self.data.len() + bytes.len() + self.reserved + consumed + 4 <= self.capacity,
             "text padding exhausted by unwind metadata"
         );
         self.data.extend(bytes);
@@ -181,12 +196,13 @@ impl Unwind {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Section {
-        let address = self
-            .shared_code_end
-            .map(|end| ((end + 7) & !7).max(self.address))
-            .unwrap_or(self.address);
-        let delta = address - self.address;
+    pub fn finish(mut self, relocate: Option<u64>) -> Section {
+        let address = relocate.unwrap_or_else(|| {
+            self.shared_code_end
+                .map(|end| ((end + 7) & !7).max(self.address))
+                .unwrap_or(self.address)
+        });
+        let delta = address.wrapping_sub(self.address);
         if delta != 0 {
             let mut cursor = 0;
             while cursor + 8 <= self.data.len() {

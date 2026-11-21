@@ -180,7 +180,14 @@ impl CodeLayout {
         if self.storage_size != 0 {
             add_storage(&mut builder, self.data_base, self.storage_size)?;
         }
-        if let Some(unwind) = &unwind {
+        let had_unwind = unwind.is_some();
+        // a segmented eh_frame rides in __SCENE next to the code (address at/after the code base)
+        // rather than the __text padding, so it is placed by add_segment, not here
+        let scene_eh = matches!(self.placement, Placement::Segment)
+            && unwind.as_ref().is_some_and(|u| u.address >= self.base);
+        if let Some(unwind) = &unwind
+            && !scene_eh
+        {
             let text_id = builder
                 .segments
                 .iter()
@@ -219,7 +226,8 @@ impl CodeLayout {
         let code_end = self.base + code.len() as u64;
         let padding = match self.placement {
             Placement::Segment => {
-                add_segment(&mut builder, self.base, code, self.page_size)?;
+                let eh = if scene_eh { unwind } else { None };
+                add_segment(&mut builder, self.base, code, eh, self.page_size)?;
                 None
             }
             Placement::Padding { offset, .. } => Some((offset, code)),
@@ -268,7 +276,7 @@ impl CodeLayout {
                 })
                 .context("rebuild lost an existing section")?;
             let delta = section.address() - replacement.address();
-            if unwind.is_some() && name == "__eh_frame" {
+            if had_unwind && name == "__eh_frame" {
                 continue;
             }
             ensure!(
@@ -304,10 +312,13 @@ impl CodeLayout {
     }
 }
 
-fn add_segment(builder: &mut Builder<'_>, base: u64, code: Vec<u8>, page_size: u64) -> Result<()> {
-    let mapped_size =
-        (code.len() as u64).checked_add(page_size - 1).context("code size overflow")?
-            & !(page_size - 1);
+fn add_segment(
+    builder: &mut Builder<'_>,
+    base: u64,
+    code: Vec<u8>,
+    eh: Option<super::unwind::Section>,
+    page_size: u64,
+) -> Result<()> {
     let linkedit_id = builder
         .segments
         .iter()
@@ -316,6 +327,7 @@ fn add_segment(builder: &mut Builder<'_>, base: u64, code: Vec<u8>, page_size: u
         .id();
     ensure!(builder.segments.get(linkedit_id).sections.is_empty(), "linkedit contains sections");
     let linkedit_size = builder.segments.get(linkedit_id).vmsize;
+    let code_len = code.len() as u64;
     let section = builder.sections.add();
     section.sectname[..6].copy_from_slice(b"__text");
     section.segname[..SEGMENT.len()].copy_from_slice(SEGMENT);
@@ -323,14 +335,35 @@ fn add_segment(builder: &mut Builder<'_>, base: u64, code: Vec<u8>, page_size: u
     section.align = 2;
     section.flags = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
     section.data = SectionData::Data(code.into());
-    let section_id = section.id();
+    let text_id = section.id();
+    // the generated eh_frame trails the code in the same segment, 8-byte aligned
+    let mut used = code_len;
+    let eh_id = if let Some(eh) = eh {
+        let eh_addr = (base + code_len + 7) & !7;
+        ensure!(eh_addr == eh.address, "segmented eh_frame address mismatch");
+        used = eh_addr - base + eh.data.len() as u64;
+        let section = builder.sections.add();
+        section.sectname[..10].copy_from_slice(b"__eh_frame");
+        section.segname[..SEGMENT.len()].copy_from_slice(SEGMENT);
+        section.addr = eh_addr;
+        section.align = 3;
+        section.data = SectionData::Data(eh.data.into());
+        Some(section.id())
+    } else {
+        None
+    };
+    let mapped_size =
+        used.checked_add(page_size - 1).context("code size overflow")? & !(page_size - 1);
     let segment = builder.segments.get_mut(linkedit_id);
     segment.segname = [0; 16];
     segment.segname[..SEGMENT.len()].copy_from_slice(SEGMENT);
     segment.vmsize = mapped_size;
     segment.maxprot = macho::VM_PROT_READ | macho::VM_PROT_EXECUTE;
     segment.initprot = segment.maxprot;
-    segment.sections.push(section_id);
+    segment.sections.push(text_id);
+    if let Some(eh_id) = eh_id {
+        segment.sections.push(eh_id);
+    }
     let segment = builder.segments.add();
     segment.segname[..10].copy_from_slice(b"__LINKEDIT");
     segment.vmaddr = base.checked_add(mapped_size).context("segment address overflow")?;

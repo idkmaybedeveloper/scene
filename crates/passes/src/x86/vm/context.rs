@@ -24,6 +24,10 @@ pub const FRAME: i64 = STATE + 128;
 pub struct Context {
     pub slots: [u8; 16],
     pub order: Vec<usize>,
+    /// emit exact unwind rows across the transient pushfq/popfq windows. only affordable when the
+    /// eh_frame has room (the __SCENE segment); in __text padding we keep the steady row to stay
+    /// small, which only costs precision for an async sample landing inside a 1-2 instruction window
+    pub precise: bool,
 }
 
 pub fn row() -> Row {
@@ -93,7 +97,7 @@ impl Context {
                 memory(Register::RSP, 256 + i * 16),
             )?);
         }
-        flags(out, false)?;
+        flags(out, false, self.precise)?;
         for &i in self.order.iter().rev() {
             if i != 4 {
                 load(out, GPRS[i], Register::RSP, self.slot(i))?;
@@ -141,19 +145,31 @@ impl Context {
     }
 }
 
-pub fn flags(out: &mut Emitter, save: bool) -> Result<()> {
-    // NOTE: pushfq/popfq shift rsp for a single instruction. describing that window precisely
-    // forces the fde to re-emit every rsp-relative register rule (~40 bytes) on each of the
-    // many arithmetic handlers, which blows the eh_frame past the __text padding. the window
-    // holds no call site, so synchronous unwinding is unaffected; we keep the steady row and
-    // only lose exactness for an async sample landing between the two instructions.
+pub fn flags(out: &mut Emitter, save: bool, precise: bool) -> Result<()> {
+    // pushfq/popfq shift rsp for a single instruction. describing that window precisely forces the
+    // fde to re-emit every rsp-relative register rule (~40 bytes) on each arithmetic handler, which
+    // is only affordable when the eh_frame lives in __SCENE; against __text padding we omit the
+    // window rows and keep the steady row, which is exact for synchronous unwinding (no call site
+    // sits in the window) and only loses an async sample landing between the two instructions.
     if save {
         out.push(Instruction::with(Code::Pushfq));
+        if precise {
+            out.unwind(row().shifted(8));
+        }
         out.push(Instruction::with1(Code::Pop_r64, Register::RDX)?);
+        if precise {
+            out.unwind(row());
+        }
         store(out, Register::RSP, FLAGS, Register::RDX)?;
     } else {
         out.push(Instruction::with1(Code::Push_rm64, memory(Register::RSP, FLAGS))?);
+        if precise {
+            out.unwind(row().shifted(8));
+        }
         out.push(Instruction::with(Code::Popfq));
+        if precise {
+            out.unwind(row());
+        }
     }
     Ok(())
 }
